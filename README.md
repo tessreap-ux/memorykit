@@ -177,3 +177,35 @@ Written for users who audit before they install.
   `MEMORYKIT_LOCK_TIMEOUT` (3600s), the next run clears it and prints
   that. A live lock is reported, never skipped silently.
 - Single file, standard library plus optional `fastembed`. Read it.
+
+
+## Install (v4.5)
+
+```sh
+sh install.sh            # checks Python >= 3.9, sqlite3, venv; offers to apt-get what is missing
+sh install.sh --yes      # same, no prompt
+sh install.sh --keyword-only   # no fastembed/numpy/model: BM25 search only
+memorykit doctor         # re-check any time; --fetch-model downloads/loads the model
+sh uninstall.sh          # removes program + venv + wrapper; never touches your memory.db/memory-log
+```
+
+Root installs to `/opt/memorykit` with the command at `/usr/local/bin/memorykit` and the model cache at
+`/var/lib/memorykit/models`; a normal user gets `~/.local/share/memorykit`, `~/.local/bin`, `~/.cache/memorykit/models`.
+The venv reuses system fastembed/numpy when present. The model cache is pinned (`MEMORYKIT_MODEL_DIR`) because
+fastembed's default lives in `/tmp`, which tmpfs wipes on reboot. The schema is embedded in `memorykit.py`, so a
+lone copy of the file works anywhere. `pip install .[vector]` also works (console script `memorykit`).
+
+## Graph ops (v4.5)
+
+Nodes are entries (weight = salience 1-10); edges are weighted and logged, so `reindex` rebuilds them.
+
+```sh
+memorykit relate --a ID --b ID [--predicate supports|contradicts|related|...] [--weight 0.8]   # 0 removes
+memorykit weigh --id ID --salience 8      # or --delta -2
+memorykit merge --keep ID --drop ID[,ID]  # supersede + move edges + record lineage; gc --restore undoes
+memorykit quarantine --id ID --degrees 2 [--apply] [--reason "..."]   # walks edges + conflict links
+memorykit quarantine --restore ID         # undo that whole sweep
+memorykit quarantine --scan               # conflict / duplicate / overlap (cos >= MEMORYKIT_OVERLAP_COS, 0.92) pairs
+```
+
+Quarantine is reversible and never pulls down an exempt neighbor (salience >= 9 or protected); those are listed as held.

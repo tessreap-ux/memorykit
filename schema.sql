@@ -37,12 +37,15 @@ CREATE TABLE IF NOT EXISTS memory_edge (
     updated    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     project    TEXT NOT NULL DEFAULT 'turns',
     subject_id TEXT NOT NULL,
-    predicate  TEXT NOT NULL,              -- currently only 'derived_from'
+    predicate  TEXT NOT NULL,              -- system: derived_from, distilled_from;
+                                           -- user/agent (via `relate`): any other word
     object_id  TEXT NOT NULL,
-    source_id  TEXT
+    source_id  TEXT,
+    weight     REAL NOT NULL DEFAULT 1.0   -- edge strength, set by `relate`
 );
 
 CREATE INDEX IF NOT EXISTS idx_edge_object ON memory_edge (object_id, predicate);
+CREATE INDEX IF NOT EXISTS idx_edge_subject ON memory_edge (subject_id, predicate);
 
 -- Explicit retrieval feedback: does this entry actually help?
 CREATE TABLE IF NOT EXISTS memory_feedback (

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memorykit"
+version = "4.5.0"
+description = "Plug-and-play vector-memory map for agents: markdown source of truth, SQLite index, provenance firewall."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+vector = ["fastembed>=0.3", "numpy"]
+
+[project.scripts]
+memorykit = "memorykit:_entry"
+
+[tool.setuptools]
+py-modules = ["memorykit"]

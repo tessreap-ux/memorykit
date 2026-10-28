@@ -62,6 +62,13 @@ import uuid
 
 DEFAULT_DB = os.environ.get("MEMORYKIT_DB", "memory.db")
 MODEL = os.environ.get("MEMORYKIT_MODEL", "BAAI/bge-small-en-v1.5")
+# Where the embedding model is cached. fastembed's own default is
+# $TMPDIR/fastembed_cache, which tmpfs wipes on reboot (then search silently
+# drops to keyword mode until the model is downloaded again).
+MODEL_DIR = os.environ.get("MEMORYKIT_MODEL_DIR") or os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "memorykit", "models")
+VERSION = "4.5.0"
 
 # Provenance -> (entry type, default confidence). Agent-originated content
 # is NEVER stored as fact: only user statements and tool observations earn
@@ -178,9 +185,20 @@ def log_md(db_path, record, display):
         fh.write(f"- {one_line} <!-- mk:{json.dumps(record, ensure_ascii=False)} -->\n")
 
 
+_MIGRATED = set()
+
+
 def connect(db_path):
     db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row
+    key = os.path.abspath(db_path)
+    if key not in _MIGRATED:
+        try:
+            migrate(db)
+            db.commit()
+        except sqlite3.OperationalError:
+            pass  # read-only or not initialized: nothing to migrate
+        _MIGRATED.add(key)
     return db
 
 
@@ -199,11 +217,90 @@ def state_set(db, key, value):
                (key, json.dumps(value)))
 
 
+# The schema is embedded so the engine works from any install location
+# (a copy in /usr/local/bin, a pip install, a zipapp). schema.sql ships beside
+# it as documentation; a test keeps the two byte-identical.
+SCHEMA = """-- memorykit schema — the vector-memory map index.
+-- Markdown is the source of truth; this database is a disposable map.
+-- Delete it any time and rebuild from markdown (see README: rebuilding).
+-- One table for entries, one for derivation edges, one for feedback.
+-- `status = 'rejected'` is the reversible quarantine (soft-delete).
+-- Automation NEVER hard-deletes rows; eviction is a human decision.
+
+CREATE TABLE IF NOT EXISTS memory_item (
+    id               TEXT PRIMARY KEY NOT NULL,
+    created          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    project          TEXT NOT NULL DEFAULT 'turns',
+    session_key      TEXT,
+    type             TEXT NOT NULL,              -- 'fact' | 'note' | 'rule'
+    content          TEXT NOT NULL,              -- stored text, provenance header included
+    salience         INTEGER NOT NULL DEFAULT 5, -- 1-10 importance
+    confidence       REAL NOT NULL DEFAULT 1.0,  -- 0.0-1.0, see DESIGN.md
+    metadata         TEXT,                       -- JSON: provenance, supersedes, keys, parents
+    embedding        TEXT,                       -- JSON list of floats, or NULL
+    status           TEXT NOT NULL DEFAULT 'confirmed', -- 'confirmed' | 'rejected'
+    superseded_by    TEXT,                       -- id of the entry that replaced this one
+    valid_from       TEXT NOT NULL,
+    valid_to         TEXT,
+    learned_at       TEXT NOT NULL,
+    last_accessed_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_item_project ON memory_item (project);
+CREATE INDEX IF NOT EXISTS idx_item_status ON memory_item (status);
+CREATE INDEX IF NOT EXISTS idx_item_superseded ON memory_item (superseded_by);
+CREATE INDEX IF NOT EXISTS idx_item_accessed ON memory_item (last_accessed_at);
+
+-- Causal DAG: subject was derived from object (used by cascade pruning).
+CREATE TABLE IF NOT EXISTS memory_edge (
+    id         TEXT PRIMARY KEY NOT NULL,
+    created    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    project    TEXT NOT NULL DEFAULT 'turns',
+    subject_id TEXT NOT NULL,
+    predicate  TEXT NOT NULL,              -- system: derived_from, distilled_from;
+                                           -- user/agent (via `relate`): any other word
+    object_id  TEXT NOT NULL,
+    source_id  TEXT,
+    weight     REAL NOT NULL DEFAULT 1.0   -- edge strength, set by `relate`
+);
+
+CREATE INDEX IF NOT EXISTS idx_edge_object ON memory_edge (object_id, predicate);
+CREATE INDEX IF NOT EXISTS idx_edge_subject ON memory_edge (subject_id, predicate);
+
+-- Explicit retrieval feedback: does this entry actually help?
+CREATE TABLE IF NOT EXISTS memory_feedback (
+    id          TEXT PRIMARY KEY NOT NULL,
+    created     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    memory_id   TEXT NOT NULL REFERENCES memory_item(id) ON DELETE CASCADE,
+    rating      TEXT NOT NULL,              -- '+1' | '-1'
+    comment     TEXT,
+    FOREIGN KEY (memory_id) REFERENCES memory_item(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_memory ON memory_feedback (memory_id);
+"""
+
+SYSTEM_PREDICATES = ("derived_from", "distilled_from")
+
+
+def migrate(db):
+    """Bring an older database up to the current schema. Additive only."""
+    cols = [r[1] for r in db.execute("PRAGMA table_info(memory_edge)")]
+    if cols and "weight" not in cols:
+        db.execute("ALTER TABLE memory_edge ADD COLUMN weight REAL NOT NULL DEFAULT 1.0")
+    if cols:
+        db.execute("CREATE INDEX IF NOT EXISTS idx_edge_subject"
+                   " ON memory_edge (subject_id, predicate)")
+
+
 def init_db(db_path):
+    d = os.path.dirname(os.path.abspath(db_path))
+    os.makedirs(d, exist_ok=True)
     db = connect(db_path)
-    db.executescript(open(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     "schema.sql")).read())
+    db.executescript(SCHEMA)
+    migrate(db)
     db.commit()
     db.close()
     print(f"initialized {db_path}")
@@ -226,7 +323,11 @@ def get_embedder():
         return None
     try:
         from fastembed import TextEmbedding
-        _embedder = TextEmbedding(model_name=MODEL)
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        try:
+            _embedder = TextEmbedding(model_name=MODEL, cache_dir=MODEL_DIR)
+        except TypeError:  # very old fastembed without cache_dir
+            _embedder = TextEmbedding(model_name=MODEL)
     except Exception:
         _embedder = None
     return _embedder
@@ -1773,6 +1874,24 @@ def cmd_reindex(args):
                           at=rec.get("at"))
                 db.commit()
                 db.close()
+            elif op == "relate":
+                db = connect(args.db)
+                try:
+                    relate(db, rec["a"], rec["b"], rec["predicate"], rec["weight"], rec["at"])
+                    db.commit()
+                except ValueError as e:
+                    print(f"replay: {e}", file=sys.stderr)
+                db.close()
+            elif op == "weigh":
+                with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+                    cmd_weigh(argparse.Namespace(db=args.db, id=rec["id"],
+                                                 salience=rec["salience"], delta=None,
+                                                 force_at=rec["at"]))
+            elif op == "merge":
+                db = connect(args.db)
+                merge(db, rec["keep"], rec["drop"], rec["at"])
+                db.commit()
+                db.close()
             elif op == "restore":
                 db = connect(args.db)
                 restore(db, rec["id"], rec.get("at"))
@@ -1816,6 +1935,322 @@ def cmd_reindex(args):
     print(f"reindexed {len(records)} record(s) from {len(files)} file(s): "
           + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     return 0
+
+
+
+# ---------------------------------------------------------------- graph ops
+#
+# Explicit node/edge operations. Nodes are entries; a node's weight is its
+# salience (1-10). Edges live in memory_edge with a weight. The system edges
+# (derived_from, distilled_from) are written only by the engine; `relate`
+# writes every other predicate. Every op is logged to markdown and replayed
+# by `reindex`, like any other state change.
+
+OVERLAP_COS = float(os.environ.get("MEMORYKIT_OVERLAP_COS", "0.92"))
+
+
+def _live_ids(db, ids):
+    out = []
+    for i in ids:
+        r = db.execute("SELECT id, status FROM memory_item WHERE id=?", (i,)).fetchone()
+        if not r:
+            raise ValueError(f"no entry {i}")
+        out.append(r["id"])
+    return out
+
+
+def relate(db, a, b, predicate, weight, at):
+    """Upsert one edge a -predicate-> b. weight <= 0 removes it."""
+    if predicate in SYSTEM_PREDICATES:
+        raise ValueError(f"{predicate} is a system edge; use another predicate")
+    if a == b:
+        raise ValueError("an entry cannot relate to itself")
+    row = db.execute("SELECT id FROM memory_edge WHERE subject_id=? AND object_id=?"
+                     " AND predicate=?", (a, b, predicate)).fetchone()
+    if weight <= 0:
+        if row:
+            db.execute("DELETE FROM memory_edge WHERE id=?", (row["id"],))
+        return "removed" if row else "absent"
+    if row:
+        db.execute("UPDATE memory_edge SET weight=?, updated=? WHERE id=?",
+                   (weight, at, row["id"]))
+        return "updated"
+    db.execute("INSERT INTO memory_edge (id, created, updated, project, subject_id,"
+               " predicate, object_id, source_id, weight) VALUES (?,?,?,?,?,?,?,?,?)",
+               (uuid.uuid4().hex[:24], at, at, "graph", a, predicate, b, None, weight))
+    return "added"
+
+
+def cmd_relate(args):
+    db = connect(args.db)
+    try:
+        a, b = _live_ids(db, [resolve_id(db, args.a), resolve_id(db, args.b)])
+        at = getattr(args, "force_at", None) or now_iso()
+        res = relate(db, a, b, args.predicate, args.weight, at)
+        db.commit()
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    finally:
+        db.close()
+    log_md(args.db, {"op": "relate", "a": a, "b": b, "predicate": args.predicate,
+                     "weight": args.weight, "at": at},
+           f"relate {short(a)} -{args.predicate}({args.weight:g})-> {short(b)}")
+    print(f"{res} {short(a)} -{args.predicate}({args.weight:g})-> {short(b)}")
+    return 0
+
+
+def cmd_weigh(args):
+    """Set a node's weight (salience 1-10). A human/agent judgment, logged."""
+    db = connect(args.db)
+    r = db.execute("SELECT salience, metadata FROM memory_item WHERE id=?",
+                   (args.id,)).fetchone()
+    if not r:
+        print(f"ERROR: no entry {args.id}", file=sys.stderr)
+        return 2
+    sal = args.salience if args.salience is not None else r["salience"] + (args.delta or 0)
+    sal = max(1, min(10, int(sal)))
+    at = getattr(args, "force_at", None) or now_iso()
+    md = json.loads(r["metadata"] or "{}")
+    md["salience_reason"] = "manual"
+    md["weighed_at"] = at
+    db.execute("UPDATE memory_item SET salience=?, metadata=?, updated=? WHERE id=?",
+               (sal, json.dumps(md), at, args.id))
+    db.commit()
+    db.close()
+    log_md(args.db, {"op": "weigh", "id": args.id, "salience": sal, "at": at},
+           f"weigh {short(args.id)} {r['salience']}->{sal}")
+    print(f"{short(args.id)} salience {r['salience']}->{sal}")
+    return 0
+
+
+def merge(db, keep, drops, at):
+    """Fold each drop into keep: supersede it, move its user edges to keep,
+    record its sources. Reversible (gc --restore DROP)."""
+    kr = db.execute("SELECT metadata FROM memory_item WHERE id=?", (keep,)).fetchone()
+    kmd = json.loads(kr["metadata"] or "{}")
+    merged = kmd.setdefault("merged_from", [])
+    q = ",".join("?" * len(SYSTEM_PREDICATES))
+    for d in drops:
+        if d == keep:
+            raise ValueError("cannot merge an entry into itself")
+        dmd = json.loads(db.execute("SELECT metadata FROM memory_item WHERE id=?",
+                                    (d,)).fetchone()["metadata"] or "{}")
+        merged.append({"id": d, "source": dmd.get("source", ""),
+                       "provenance": dmd.get("provenance", "")})
+        for e in db.execute(f"SELECT * FROM memory_edge WHERE (subject_id=? OR object_id=?)"
+                            f" AND predicate NOT IN ({q})", (d, d, *SYSTEM_PREDICATES)).fetchall():
+            a = keep if e["subject_id"] == d else e["subject_id"]
+            b = keep if e["object_id"] == d else e["object_id"]
+            db.execute("DELETE FROM memory_edge WHERE id=?", (e["id"],))
+            if a != b:
+                relate(db, a, b, e["predicate"], e["weight"], at)
+        db.execute("UPDATE memory_item SET superseded_by=? WHERE id=?", (keep, d))
+        tombstone(db, d, f"merged into {keep}", at=at)
+    db.execute("UPDATE memory_item SET metadata=?, updated=? WHERE id=?",
+               (json.dumps(kmd), at, keep))
+
+
+def cmd_merge(args):
+    db = connect(args.db)
+    try:
+        keep = _live_ids(db, [resolve_id(db, args.keep)])[0]
+        drops = _live_ids(db, [resolve_id(db, x) for x in args.drop.split(",") if x.strip()])
+        at = getattr(args, "force_at", None) or now_iso()
+        merge(db, keep, drops, at)
+        db.commit()
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    finally:
+        db.close()
+    log_md(args.db, {"op": "merge", "keep": keep, "drop": drops, "at": at},
+           f"merge {','.join(short(d) for d in drops)} -> {short(keep)}")
+    print(f"merged {len(drops)} into {short(keep)}")
+    return 0
+
+
+def neighborhood(db, root, degrees):
+    """Breadth-first walk over every edge (both directions, weight > 0) and
+    every recorded conflict link, up to `degrees` hops. Returns
+    {id: (hop, via_predicate)}."""
+    seen = {root: (0, "")}
+    frontier = [root]
+    for hop in range(1, degrees + 1):
+        nxt = []
+        for n in frontier:
+            pairs = [(e["object_id"], e["predicate"]) for e in db.execute(
+                "SELECT object_id, predicate FROM memory_edge WHERE subject_id=? AND weight>0", (n,))]
+            pairs += [(e["subject_id"], e["predicate"]) for e in db.execute(
+                "SELECT subject_id, predicate FROM memory_edge WHERE object_id=? AND weight>0", (n,))]
+            r = db.execute("SELECT metadata FROM memory_item WHERE id=?", (n,)).fetchone()
+            md = json.loads(r["metadata"] or "{}") if r else {}
+            pairs += [(c, "conflict") for c in md.get("possible_conflict_with", []) or []
+                      if isinstance(c, str)]
+            for m, pred in pairs:
+                if m not in seen:
+                    seen[m] = (hop, pred)
+                    nxt.append(m)
+        frontier = nxt
+    return seen
+
+
+def scan(db):
+    """Quarantine candidates, by reason: conflict, duplicate, overlap."""
+    rows = live_rows(db)
+    ids = {r["id"] for r in rows}
+    out = []
+    for r in rows:
+        md = json.loads(r["metadata"] or "{}")
+        for c in md.get("possible_conflict_with", []) or []:
+            if isinstance(c, str) and c in ids and r["id"] < c:
+                out.append(("conflict", r["id"], c, 0.0))
+    dup = set()
+    for a, b, cos, _ in dedup_candidates(rows):
+        out.append(("duplicate", a["id"], b["id"], cos))
+        dup.add(frozenset((a["id"], b["id"])))
+    try:
+        import numpy as np
+    except ImportError:
+        return out
+    vr = [(r, load_vec(r)) for r in rows]
+    vr = [(r, v) for r, v in vr if v]
+    if len(vr) > 1:
+        m = np.asarray([v for _, v in vr], dtype=np.float32)
+        m /= np.linalg.norm(m, axis=1, keepdims=True)
+        sims = m @ m.T
+        for i in range(len(vr)):
+            for j in np.nonzero(sims[i, i + 1:] >= OVERLAP_COS)[0]:
+                j = i + 1 + int(j)
+                a, b = vr[i][0]["id"], vr[j][0]["id"]
+                if frozenset((a, b)) not in dup:
+                    out.append(("overlap", a, b, float(sims[i, j])))
+    return out
+
+
+def cmd_quarantine(args):
+    """Quarantine an entry and, with --degrees N, everything within N hops of
+    it (edges + conflict links). Dry run unless --apply. Reversible with
+    --restore ROOT. --scan lists conflict/duplicate/overlap candidates."""
+    db = connect(args.db)
+    if args.scan:
+        c = scan(db)
+        for kind, a, b, v in c:
+            print(f"{kind} {short(a)} {short(b)}" + (f" {v:.3f}" if v else ""))
+        print(f"{len(c)} candidate pair(s)" if c else "no candidates")
+        db.close()
+        return 0
+    at = getattr(args, "force_at", None) or now_iso()
+    if args.restore:
+        root = args.restore
+        tag = f"quarantine via {root}"
+        hit = [r["id"] for r in db.execute(
+            "SELECT id, metadata FROM memory_item WHERE status='rejected'")
+            if tag in (r["metadata"] or "")]
+        n = sum(restore(db, i, at) for i in hit)
+        db.commit()
+        db.close()
+        for i in hit:
+            log_md(args.db, {"op": "restore", "id": i, "at": at}, f"restore {short(i)}")
+        print(f"restored {n} row(s) quarantined via {short(root)}")
+        return 0
+    if not args.id:
+        print("ERROR: give --id, --scan, or --restore", file=sys.stderr)
+        return 2
+    root = args.id
+    if not db.execute("SELECT 1 FROM memory_item WHERE id=?", (root,)).fetchone():
+        print(f"ERROR: no entry {root}", file=sys.stderr)
+        return 2
+    hood = neighborhood(db, root, args.degrees)
+    plan, held = [], []
+    for eid, (hop, pred) in sorted(hood.items(), key=lambda x: x[1][0]):
+        r = db.execute("SELECT status, salience, metadata FROM memory_item WHERE id=?",
+                       (eid,)).fetchone()
+        if not r or r["status"] == "rejected":
+            continue
+        md = json.loads(r["metadata"] or "{}")
+        if hop and is_exempt(r, md):
+            held.append((eid, hop, pred))
+        else:
+            plan.append((eid, hop, pred))
+    for eid, hop, pred in plan:
+        print(f"{'quarantine' if args.apply else 'would quarantine'} {short(eid)} hop={hop}"
+              + (f" via={pred}" if pred else ""))
+    for eid, hop, pred in held:
+        print(f"held (exempt) {short(eid)} hop={hop} via={pred}")
+    if args.apply:
+        reason = args.reason or "manual"
+        for eid, hop, _ in plan:
+            tombstone(db, eid, f"quarantine via {root} hop {hop}: {reason}", at=at)
+        db.commit()
+        for eid, hop, _ in plan:
+            log_md(args.db, {"op": "quarantine", "id": eid, "at": at,
+                             "reason": f"quarantine via {root} hop {hop}: {reason}"},
+                   f"quarantine {short(eid)} (via {short(root)}, hop {hop})")
+    elif plan:
+        print("dry run — pass --apply")
+    db.close()
+    return 0
+
+
+def _on_tmpfs(path):
+    try:
+        best, fs = "", ""
+        for line in open("/proc/mounts"):
+            parts = line.split()
+            if len(parts) > 2 and path.startswith(parts[1]) and len(parts[1]) > len(best):
+                best, fs = parts[1], parts[2]
+        return fs in ("tmpfs", "ramfs")
+    except OSError:
+        return False
+
+
+def cmd_doctor(args):
+    """Check the runtime. One line per check; exit 1 on any FAIL."""
+    res = []
+    v = sys.version_info
+    res.append(("ok" if v >= (3, 9) else "FAIL", "python", f"{v.major}.{v.minor}.{v.micro}"))
+    res.append(("ok" if sqlite3.sqlite_version_info >= (3, 24) else "FAIL",
+                "sqlite", sqlite3.sqlite_version))
+    try:
+        import numpy
+        res.append(("ok", "numpy", numpy.__version__))
+    except ImportError:
+        res.append(("WARN", "numpy", "missing: vector search uses slow pure-Python path"))
+    try:
+        import fastembed
+        res.append(("ok", "fastembed", getattr(fastembed, "__version__", "?")))
+        fe = True
+    except ImportError:
+        res.append(("WARN", "fastembed", "missing: keyword-only search (install memorykit[vector])"))
+        fe = False
+    md = os.path.abspath(MODEL_DIR)
+    cached = os.path.isdir(md) and any(os.scandir(md))
+    if fe and getattr(args, "fetch_model", False):
+        global _embedder_tried
+        _embedder_tried = False
+        ok = bool(embed_texts(["memorykit doctor"]))
+        res.append(("ok" if ok else "FAIL", "model", f"{MODEL} loaded from {md}"
+                    if ok else f"could not load {MODEL} (offline and not cached?)"))
+        cached = ok
+    elif fe:
+        res.append(("ok" if cached else "WARN", "model",
+                    f"cached in {md}" if cached else f"not cached in {md}; run doctor --fetch-model"))
+    if cached and _on_tmpfs(md):
+        res.append(("WARN", "model_dir", f"{md} is on tmpfs; it is wiped on reboot"))
+    d = os.path.dirname(os.path.abspath(args.db))
+    res.append(("ok" if os.access(d if os.path.isdir(d) else os.path.dirname(d), os.W_OK)
+                else "FAIL", "db_dir", d))
+    if os.path.exists(args.db):
+        try:
+            n = connect(args.db).execute("SELECT count(*) FROM memory_item").fetchone()[0]
+            res.append(("ok", "db", f"{args.db} ({n} rows)"))
+        except sqlite3.DatabaseError as e:
+            res.append(("FAIL", "db", f"{args.db}: {e}"))
+    res.append(("ok", "version", VERSION))
+    for st, name, detail in res:
+        print(f"{st:4} {name}: {detail}")
+    return 1 if any(st == "FAIL" for st, _, _ in res) else 0
 
 
 def main():
@@ -1935,8 +2370,44 @@ def main():
     p.add_argument("--markdown", required=True)
     p.set_defaults(fn=cmd_correlate)
 
+    p = sub.add_parser("relate", help="add/update/remove a weighted edge")
+    p.add_argument("--a", required=True)
+    p.add_argument("--b", required=True)
+    p.add_argument("--predicate", default="related",
+                   help="any word except derived_from/distilled_from (e.g. supports, contradicts)")
+    p.add_argument("--weight", type=float, default=1.0, help="0 removes the edge")
+    p.set_defaults(fn=cmd_relate)
+
+    p = sub.add_parser("weigh", help="set a node's weight (salience 1-10)")
+    p.add_argument("--id", required=True)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--salience", type=int)
+    g.add_argument("--delta", type=int)
+    p.set_defaults(fn=cmd_weigh)
+
+    p = sub.add_parser("merge", help="fold entries into one (reversible)")
+    p.add_argument("--keep", required=True)
+    p.add_argument("--drop", required=True, help="id[,id...]")
+    p.set_defaults(fn=cmd_merge)
+
+    p = sub.add_parser("quarantine", help="quarantine by degrees of separation")
+    p.add_argument("--id", default="")
+    p.add_argument("--degrees", type=int, default=0)
+    p.add_argument("--reason", default="")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--scan", action="store_true", help="list conflict/duplicate/overlap pairs")
+    p.add_argument("--restore", default="", help="undo a quarantine by its root id")
+    p.set_defaults(fn=cmd_quarantine)
+
+    p = sub.add_parser("doctor", help="check python, sqlite, deps, model cache")
+    p.add_argument("--fetch-model", action="store_true", help="download/load the model now")
+    p.set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("version")
+    p.set_defaults(fn=lambda a: print(VERSION) or 0)
+
     args = ap.parse_args()
-    if args.cmd not in ("init", "reindex") and not os.path.exists(args.db):
+    if args.cmd not in ("init", "reindex", "doctor", "version") and not os.path.exists(args.db):
         print(f"no database at {args.db} — run `init` first", file=sys.stderr)
         return 1
     if not _REPLAYING and os.path.exists(args.db):
@@ -1973,10 +2444,10 @@ def resolve_id(db, ref):
 def _expand_ids(args):
     db = connect(args.db)
     try:
-        for f in ("id", "old", "new", "restore"):
+        for f in ("id", "old", "new", "restore", "keep", "a", "b"):
             if isinstance(getattr(args, f, None), str) and getattr(args, f):
                 setattr(args, f, resolve_id(db, getattr(args, f)))
-        for f in ("supersedes", "parent_ids"):
+        for f in ("supersedes", "parent_ids", "drop"):
             v = getattr(args, f, None)
             if isinstance(v, str) and v:
                 setattr(args, f, ",".join(resolve_id(db, x)
@@ -1985,6 +2456,11 @@ def _expand_ids(args):
         pass  # not initialized yet
     finally:
         db.close()
+
+
+def _entry():
+    """console_scripts entry point (pip install / pyproject)."""
+    sys.exit(main())
 
 
 if __name__ == "__main__":

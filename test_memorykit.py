@@ -672,6 +672,92 @@ def run_mode(mode):
     mk.SETTLE_TURNS, mk.SWEEP_EVERY = old_settle, old_sweep
     mk.AUTO = False
 
+
+    # 12. v4.5: packaging, migration, explicit graph ops, quarantine by degrees.
+    mk.AUTO = False
+    check("schema: embedded copy matches schema.sql",
+          mk.SCHEMA == open(os.path.join(HERE, "schema.sql")).read())
+    lone = os.path.join(tmp, "lone")
+    os.makedirs(lone)
+    shutil.copy(os.path.join(HERE, "memorykit.py"), os.path.join(lone, "memorykit"))
+    env = dict(os.environ, MEMORYKIT_NO_EMBED="1")
+    rc = subprocess.call([sys.executable, os.path.join(lone, "memorykit"), "--db",
+                          os.path.join(lone, "sub", "m.db"), "init"], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    check("install: init works from a lone copy with no schema.sql beside it",
+          rc == 0 and os.path.exists(os.path.join(lone, "sub", "m.db")))
+    old = os.path.join(tmp, "old.db")
+    o = sqlite3.connect(old)
+    o.execute("CREATE TABLE memory_edge (id TEXT PRIMARY KEY, created TEXT, updated TEXT,"
+              " project TEXT, subject_id TEXT, predicate TEXT, object_id TEXT, source_id TEXT)")
+    o.commit(); o.close()
+    mk.connect(old).close()
+    cols = [r[1] for r in sqlite3.connect(old).execute("PRAGMA table_info(memory_edge)")]
+    check("migrate: pre-4.5 edge table gains weight column", "weight" in cols)
+
+    os.environ["MEMORYKIT_MD_DIR"] = os.path.join(tmp, "graph-log")
+    k.fresh()
+    a, _, _ = k.cap("user", "Graph node alpha: the lighthouse keeper logs ships at dawn.")
+    b, _, _ = k.cap("user", "Graph node beta: the harbor master files the dawn log weekly.")
+    c, _, _ = k.cap("user", "Graph node gamma: weekly filings go to the island council.")
+    d, _, _ = k.cap("user", "Graph node delta: the council meets on the first Monday.")
+    x, _, _ = k.cap("user", "Graph node exempt: never move the council archive.", "--salience", "10")
+    rc, out, _ = k.run("relate", "--a", a["id"][:8], "--b", b["id"][:8], "--predicate", "supports")
+    k.run("relate", "--a", b["id"], "--b", c["id"], "--weight", "0.5")
+    k.run("relate", "--a", c["id"], "--b", d["id"])
+    k.run("relate", "--a", b["id"], "--b", x["id"])
+    check("relate: edge added by short ids", rc == 0 and out.startswith("added"), out.strip())
+    rc, out, _ = k.run("relate", "--a", b["id"], "--b", c["id"], "--weight", "0.8")
+    w = k.sql("SELECT weight FROM memory_edge WHERE subject_id=? AND object_id=?", (b["id"], c["id"]))
+    check("relate: re-relating updates the weight", out.startswith("updated") and w == [(0.8,)])
+    rc, _, err = k.run("relate", "--a", a["id"], "--b", b["id"], "--predicate", "derived_from")
+    check("relate: system predicates refused", rc == 2 and "system edge" in err)
+    k.run("weigh", "--id", a["id"], "--salience", "8")
+    k.run("weigh", "--id", d["id"], "--delta", "99")
+    sal = dict(k.sql("SELECT id, salience FROM memory_item"))
+    check("weigh: sets node weight and clamps to 1-10", sal[a["id"]] == 8 and sal[d["id"]] == 10,
+          f"{sal[a['id']]} {sal[d['id']]}")
+    rc, out, _ = k.run("quarantine", "--id", a["id"], "--degrees", "2")
+    st = dict(k.sql("SELECT id, status FROM memory_item"))
+    check("quarantine: dry run lists hops and changes nothing",
+          "would quarantine" in out and "hop=2" in out and st[a["id"]] == "confirmed", out.strip())
+    k.run("quarantine", "--id", a["id"], "--degrees", "2", "--apply", "--reason", "test")
+    st = dict(k.sql("SELECT id, status FROM memory_item"))
+    check("quarantine: root and 2 degrees out quarantined",
+          st[a["id"]] == st[b["id"]] == st[c["id"]] == "rejected")
+    check("quarantine: 3rd degree untouched, exempt neighbor held",
+          st[d["id"]] == "confirmed" and st[x["id"]] == "confirmed")
+    rc, out, _ = k.run("quarantine", "--restore", a["id"])
+    st = dict(k.sql("SELECT id, status FROM memory_item"))
+    check("quarantine: --restore ROOT undoes the whole sweep",
+          st[a["id"]] == st[b["id"]] == st[c["id"]] == "confirmed", out.strip())
+    e, _, _ = k.cap("user", "Graph node beta again: the harbor master files the dawn log each week.")
+    k.run("relate", "--a", e["id"], "--b", d["id"], "--predicate", "mentions")
+    rc, out, _ = k.run("merge", "--keep", b["id"], "--drop", e["id"][:8])
+    row = k.sql("SELECT status, superseded_by FROM memory_item WHERE id=?", (e["id"],))[0]
+    moved = k.sql("SELECT 1 FROM memory_edge WHERE subject_id=? AND object_id=? AND predicate='mentions'",
+                  (b["id"], d["id"]))
+    mf = k.sql("SELECT json_extract(metadata,'$.merged_from[0].id') FROM memory_item WHERE id=?", (b["id"],))[0][0]
+    check("merge: drop superseded, its edges moved to keep, lineage recorded",
+          row == ("rejected", b["id"]) and moved and mf == e["id"], f"{row} {moved} {mf}")
+    before = sorted(k.sql("SELECT subject_id, predicate, object_id, weight FROM memory_edge"
+                          " WHERE project='graph'"))
+    sb = snapshot(k)
+    os.remove(k.db)
+    k.run("reindex", "--force")
+    after = sorted(k.sql("SELECT subject_id, predicate, object_id, weight FROM memory_edge"
+                         " WHERE project='graph'"))
+    sa = [r[:6] for r in snapshot(k)]
+    check("reindex: graph edges, weights, salience and merges rebuild from markdown",
+          before == after and [r[:6] for r in sb] == sa, f"{before==after} {set(map(tuple,[r[:6] for r in sb]))^set(map(tuple,sa))}")
+    dup1, _, _ = k.cap("user", "Exact duplicate line for the scan check about pier nine.")
+    dup2, _, _ = k.cap("user", "Exact duplicate line for the scan check about pier nine.")
+    rc, out, _ = k.run("quarantine", "--scan")
+    check("quarantine --scan: reports duplicate pairs" if vec else "quarantine --scan: runs without vectors",
+          rc == 0 and (("duplicate" in out) if vec else True), out.strip()[:120])
+    rc, out, _ = k.run("doctor")
+    check("doctor: runs and reports version", rc == 0 and mk.VERSION in out, out.strip()[:200])
+
     fails = [r for r in RESULTS if not r[1]]
     print(f"--- {mode}: {len(RESULTS) - len(fails)}/{len(RESULTS)} passed")
     return 1 if fails else 0
