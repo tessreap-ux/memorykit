@@ -300,33 +300,34 @@ def value_change(a, b):
 def novelty_adjust(db, text, salience):
     """Restatements can't inflate into importance; novelty gets +1.
 
-    Compares against the top-8 live entries by embedding cosine (plus a
-    difflib check, which catches near-verbatim restatements that
-    mean-pooling under-scores when lengths differ). Never raises: on any
+    Cosine against every live entry, plus a difflib check (which catches
+    near-verbatim restatements that mean-pooling under-scores when lengths
+    differ) on the nearest candidates by cosine and by BM25. Never raises: on any
     failure the heuristic salience stands.
     """
     try:
         rows = live_rows(db)
         if not rows:
             return min(10, salience + 1), "novel"
-        vec = None
         vecs = embed_texts([text[:4000]])
-        if vecs:
-            vec = vecs[0]
+        vec = vecs[0] if vecs else None
+        # Score cosine for all rows in one matrix product, then run the
+        # (slow) difflib check only on the 20 nearest by cosine plus the 20
+        # nearest by BM25. BM25 candidates keep keyword mode honest: with no
+        # embedder every cosine is 0, and cosine-only candidates would just
+        # be the oldest rows.
+        sims = _doc_sims(db, rows, vec) if vec else [0.0] * len(rows)
+        lex, _ = _bm25(_tokens(text), _doc_tokens(db, rows))
+        order = lambda xs: sorted(range(len(rows)), key=lambda i: -xs[i])[:20]
+        cand = set(order(sims)) | set(i for i in order(lex) if lex[i] > 0)
         scored = []
-        for r in rows:
-            rv = load_vec(r)
-            c = cosine(vec, rv) if (vec and rv) else 0.0
-            body = re.sub(r"^\[turn provenance=[^\]]*\]\n", "",
-                          r["content"] or "")
-            t = difflib.SequenceMatcher(None, text[:2000], body[:2000]).ratio()
+        for i in cand:
+            body = _body(rows[i]["content"])
             if value_change(text, body):
                 continue  # a changed value is news, not a restatement
-            scored.append((max(c, 0.0), t))
-        # Cosine and text similarity are judged independently across ALL
-        # live rows. (Taking text similarity only from the top-8-by-cosine
-        # rows breaks the gate when no embedder is installed: every cosine
-        # is 0, so the top 8 are just the 8 oldest rows.)
+            sm = difflib.SequenceMatcher(None, text[:2000], body[:2000])
+            t = sm.ratio() if sm.real_quick_ratio() > NOVELTY_RESTATEMENT_TXT else 0.0
+            scored.append((max(sims[i], 0.0), t))
         best_cos = max(c for c, _ in scored) if scored else 0.0
         best_txt = max(t for _, t in scored) if scored else 0.0
         if best_cos > NOVELTY_RESTATEMENT_COS or best_txt > NOVELTY_RESTATEMENT_TXT:
@@ -415,6 +416,16 @@ def cmd_capture(args):
         "salience_reason": "manual" if args.salience else "heuristic",
         "novelty": novelty,
     }
+    # Attribution: who said it, kept apart from who it quotes. Quoted text
+    # lives in metadata, not content, so it is never indexed as the
+    # quoter's own words (search finds it under its original speaker).
+    src = (getattr(args, "source", "") or "").strip()
+    if src:
+        metadata["source"] = src
+    qtext = (getattr(args, "quote", "") or "").strip()
+    if qtext:
+        metadata["quote"] = {"source": (getattr(args, "quote_source", "") or "").strip(),
+                             "text": qtext[:500]}
     if args.supersedes:
         metadata["supersedes"] = [s.strip() for s in args.supersedes.split(",") if s.strip()]
     if args.supersession_key:
@@ -484,7 +495,8 @@ def cmd_capture(args):
         "session": args.session or "", "turn": args.turn,
         "supersedes": sorted(set(retired)), "supersession_key": skey or "",
         "parents": parent_ids, "protected": bool(args.protected),
-        "novelty": novelty},
+        "novelty": novelty, "source": src,
+        "quote": metadata.get("quote", {})},
         f"[{provenance}] {text}")
     # Terse receipt: the id and the one number that decides its fate.
     print(f"saved id={short(new_id)} salience={salience}"
@@ -528,28 +540,91 @@ def _tokens(text):
 
 
 def _bm25(query_toks, docs, k1=1.2, b=0.75):
-    """Plain BM25 over the candidate set. Stdlib only."""
+    """Plain BM25 over the candidate set. Stdlib only. One pass: only the
+    query's terms are counted, and only documents containing one are scored."""
     n = len(docs)
     if not n:
         return [], {}
+    q = set(query_toks)
     avgdl = sum(len(d) for d in docs) / n or 1.0
-    df = {}
-    for d in docs:
-        for t in set(d):
-            df[t] = df.get(t, 0) + 1
-    idf = {t: math.log(1 + (n - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5))
-           for t in set(query_toks)}
-    out = []
-    for d in docs:
-        tf = {}
-        for t in d:
-            if t in idf:
-                tf[t] = tf.get(t, 0) + 1
+    df = dict.fromkeys(q, 0)
+    hits = []
+    for i, d in enumerate(docs):
+        common = q.intersection(d)
+        if common:
+            for t in common:
+                df[t] += 1
+            hits.append((i, common))
+    idf = {t: math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5)) for t in q}
+    out = [0.0] * n
+    for i, common in hits:
+        d = docs[i]
+        norm = k1 * (1 - b + b * len(d) / avgdl)
         sc = 0.0
-        for t, f in tf.items():
-            sc += idf[t] * f * (k1 + 1) / (f + k1 * (1 - b + b * len(d) / avgdl))
-        out.append(sc)
+        for t in common:
+            f = d.count(t)
+            sc += idf[t] * f * (k1 + 1) / (f + norm)
+        out[i] = sc
     return out, idf
+
+
+def _cache_tables(db):
+    db.execute("CREATE TABLE IF NOT EXISTS lex_cache (id TEXT PRIMARY KEY, toks TEXT)")
+    db.execute("CREATE TABLE IF NOT EXISTS vec_cache (id TEXT PRIMARY KEY, v BLOB)")
+
+
+def _doc_tokens(db, rows):
+    """Per-row lexical tokens, cached by id (entry text never changes after
+    capture). Derived data: safe to drop, refilled on demand, never logged."""
+    _cache_tables(db)
+    have = dict(db.execute("SELECT id, toks FROM lex_cache"))
+    out, new = [], []
+    for r in rows:
+        t = have.get(r["id"])
+        if t is None:
+            t = " ".join(_tokens(_body(r["content"])))
+            new.append((r["id"], t))
+        out.append(t.split() if t else [])
+    if new:
+        db.executemany("INSERT OR REPLACE INTO lex_cache VALUES (?, ?)", new)
+        db.commit()
+    return out
+
+
+def _doc_sims(db, rows, qvec):
+    """Cosine of every row to the query. With numpy (always present when the
+    embedder is), vectors are cached as normalized float32 blobs and scored
+    in one matrix product; otherwise falls back to pure Python."""
+    try:
+        import numpy as np
+    except ImportError:
+        return [cosine(qvec, v) if (v := load_vec(r)) else 0.0 for r in rows]
+    _cache_tables(db)
+    have = dict(db.execute("SELECT id, v FROM vec_cache"))
+    dim = len(qvec)
+    mat = np.zeros((len(rows), dim), dtype=np.float32)
+    new = []
+    for i, r in enumerate(rows):
+        blob = have.get(r["id"])
+        if blob is None:
+            v = load_vec(r)
+            if not v or len(v) != dim:
+                continue
+            a = np.asarray(v, dtype=np.float32)
+            nrm = float(np.linalg.norm(a))
+            if not nrm:
+                continue
+            a /= nrm
+            new.append((r["id"], a.tobytes()))
+            mat[i] = a
+        elif len(blob) == dim * 4:
+            mat[i] = np.frombuffer(blob, dtype=np.float32)
+    if new:
+        db.executemany("INSERT OR REPLACE INTO vec_cache VALUES (?, ?)", new)
+        db.commit()
+    q = np.asarray(qvec, dtype=np.float32)
+    q /= (np.linalg.norm(q) or 1.0)
+    return (mat @ q).tolist()
 
 
 def _minmax(xs):
@@ -562,7 +637,14 @@ def _minmax(xs):
     return [(x - lo) / (hi - lo) for x in xs]
 
 
-def search_rows(db, query, limit):
+def _source_of(r):
+    try:
+        return json.loads(r["metadata"] or "{}").get("source", "")
+    except (json.JSONDecodeError, TypeError):
+        return ""
+
+
+def search_rows(db, query, limit, source=""):
     """Hybrid retrieval, live rows only.
 
     relevance = (1-w) * minmax(cosine) + w * minmax(BM25), where w is how much
@@ -572,12 +654,15 @@ def search_rows(db, query, limit):
     they never outrank it. On a 36-query benchmark the old product
     (sim x salience) put the target in the top 5 about 10% of the time."""
     rows = live_rows(db)
+    if source:
+        want = source.strip().lower()
+        rows = [r for r in rows if _source_of(r).lower() == want]
     if not rows:
         return []
     vecs = embed_texts([query[:4000]])
     qvec = vecs[0] if vecs else None
     qt = _tokens(query)
-    docs = [_tokens(_body(r["content"])) for r in rows]
+    docs = _doc_tokens(db, rows)
     lex, idf = _bm25(qt, docs)
     best = max(range(len(rows)), key=lambda i: lex[i])
     tot = sum(idf.values()) or 1.0
@@ -585,7 +670,7 @@ def search_rows(db, query, limit):
     w = cover ** 2
     sims = None
     if qvec:
-        sims = [cosine(qvec, load_vec(r)) if load_vec(r) else 0.0 for r in rows]
+        sims = _doc_sims(db, rows, qvec)
     if sims and any(sims):
         sn, ln = _minmax(sims), _minmax(lex) if max(lex) > 0 else [0.0] * len(lex)
         rel = [(1 - w) * a + w * b for a, b in zip(sn, ln)]
@@ -661,7 +746,7 @@ def snippet(text, query, width, qvec=None):
 
 def cmd_search(args):
     db = connect(args.db)
-    hits = search_rows(db, args.query, args.limit)
+    hits = search_rows(db, args.query, args.limit, getattr(args, "source", ""))
     qv = embed_texts([args.query[:4000]]) if hits else None
     qv = qv[0] if qv else None
     budget = getattr(args, "budget", 0) or 0  # approx tokens, 4 chars each
@@ -675,7 +760,8 @@ def cmd_search(args):
             line = (f"- id={r['id']} type={r['type']} sal={r['salience']} "
                     f"conf={r['confidence']} score={score:.3f}\n  {snip}")
         else:
-            line = f"{short(r['id'])} {r['type']} {snip}"
+            src = _source_of(r)
+            line = f"{short(r['id'])} {r['type']}{'@' + src if src else ''} {snip}"
         cost = len(line) // 4 + 1
         if budget and shown and used + cost > budget:
             break
@@ -1168,7 +1254,7 @@ def find_conflicts(db, text, vec):
 
 
 def insert_semantic(db, db_path, eid, at, text, provenance, salience, turns,
-                    supersession_key="", protected=False):
+                    supersession_key="", protected=False, source=""):
     if db.execute("SELECT 1 FROM memory_item WHERE id=?", (eid,)).fetchone():
         return  # idempotent: replay or a re-logged record
     mtype, confidence = PROVENANCE[provenance]
@@ -1178,6 +1264,8 @@ def insert_semantic(db, db_path, eid, at, text, provenance, salience, turns,
         md["supersession_key"] = supersession_key
     if protected:
         md["protected"] = True
+    if source:
+        md["source"] = source
     vecs = embed_texts([text[:4000]])
     conflicts = find_conflicts(db, text, vecs[0] if vecs else None)
     if conflicts:
@@ -1550,6 +1638,7 @@ def _sleep(args):
                                  "turns": emd.get("distilled_from", group),
                                  "supersession_key": emd.get("supersession_key", ""),
                                  "protected": bool(emd.get("protected")),
+                                 "source": emd.get("source", ""),
                                  "relogged": True},
                        f"[distilled, re-logged] {_body(er['content'])}")
             else:
@@ -1564,13 +1653,15 @@ def _sleep(args):
                 insert_semantic(db, args.db, parent, at, text, prov,
                                 t["salience"], group,
                                 md.get("supersession_key", ""),
-                                bool(md.get("protected")))
+                                bool(md.get("protected")),
+                                md.get("source", ""))
                 db.commit()
                 log_md(args.db, {"op": "distill", "id": parent, "at": at,
                                  "text": text, "provenance": prov,
                                  "salience": t["salience"], "turns": group,
                                  "supersession_key": md.get("supersession_key", ""),
-                                 "protected": bool(md.get("protected"))},
+                                 "protected": bool(md.get("protected")),
+                                 "source": md.get("source", "")},
                        f"[distilled {prov}] {text}")
                 distilled += 1
             # verify, then wipe
@@ -1639,6 +1730,9 @@ def cmd_reindex(args):
                         rec.get("parents", [])), check=False,
                     project=rec.get("project", "turns"),
                     protected=rec.get("protected", False),
+                    source=rec.get("source", ""),
+                    quote=(rec.get("quote") or {}).get("text", ""),
+                    quote_source=(rec.get("quote") or {}).get("source", ""),
                     force_id=rec["id"], force_at=rec["at"])
                 with open(os.devnull, "w") as devnull:
                     old = sys.stdout
@@ -1693,7 +1787,8 @@ def cmd_reindex(args):
                 insert_semantic(db, args.db, rec["id"], rec["at"], rec["text"],
                                 rec["provenance"], rec["salience"], rec["turns"],
                                 rec.get("supersession_key", ""),
-                                rec.get("protected", False))
+                                rec.get("protected", False),
+                                rec.get("source", ""))
                 db.commit()
                 db.close()
             elif op == "end_session":
@@ -1741,6 +1836,12 @@ def main():
     p.add_argument("--project", default="turns")
     p.add_argument("--protected", action="store_true",
                    help="exempt from GC and from cascade quarantine")
+    p.add_argument("--source", default="",
+                   help="who said it (a name or handle); kept apart from provenance")
+    p.add_argument("--quote", default="",
+                   help="text this turn quotes; stored as metadata, never indexed "
+                        "as this speaker's words")
+    p.add_argument("--quote-source", default="", help="who the quoted text is from")
     p.add_argument("--no-auto", action="store_true",
                    help="skip the settled-turn distill check for this capture")
     p.set_defaults(fn=cmd_capture)
@@ -1754,6 +1855,7 @@ def main():
                    help="stop once ~N tokens of output are used (0 = no cap)")
     p.add_argument("--verbose", action="store_true",
                    help="show salience, confidence, and score")
+    p.add_argument("--source", default="", help="only entries from this speaker")
     p.set_defaults(fn=cmd_search)
 
     p = sub.add_parser("get")

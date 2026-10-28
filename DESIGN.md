@@ -155,6 +155,53 @@ tokens. For agents whose tokens don't refresh, that is lifespan. So:
   phrasing scored under the floor. The hit counter lives in the DB, not
   the log, so a reindex resets it. That's a soft signal, by design.
 
+## Attribution
+
+`capture --source NAME` records who said a turn, separately from its
+provenance (provenance is how much to trust it; source is whose words
+they are). `--quote TEXT --quote-source NAME` records what the turn
+quotes. The quote is stored in metadata, never in the indexed content,
+so a reply that quotes someone isn't found as the replier's own claim.
+Search shows `fact@NAME`, and `search --source NAME` filters to one
+speaker. Source and quote carry through distillation and survive a
+rebuild from the log.
+
+## Scale
+
+Search and the novelty gate used to parse every row's JSON embedding
+on every call: about 9.7 s per search at 20,000 rows. Now:
+
+- Normalized float32 vectors are cached in `vec_cache` and scored in
+  one numpy matrix product.
+- Lexical tokens are cached in `lex_cache`, and BM25 scores only the
+  documents that contain a query term.
+- The novelty gate runs difflib only on the 20 nearest rows by cosine
+  plus the 20 nearest by BM25. It used to run on every row.
+
+Both caches are derived data. They are filled on demand, never logged,
+and safe to delete. Measured at 20,000 rows: search takes about 0.7 s
+warm (the first call fills the cache, about 5 s), and the capture
+novelty check takes about 1.1 to 1.6 s. Everything is still a linear
+scan, so past roughly 100,000 rows you'll want a real vector index.
+
+## Held-out benchmark
+
+30 question/answer pairs written by a separate agent that never saw the
+kit or the tuning queries (15 that reuse some of the answer's wording,
+15 paraphrases). This set was never tuned on:
+
+| | R@1 | R@5 | MRR |
+|---|---|---|---|
+| old: sim x salience | 0.23 | 0.30 | 0.27 |
+| pure cosine | 0.53 | 0.73 | 0.63 |
+| hybrid (vector mode) | 0.53 | 0.77 | 0.62 |
+| keyword mode | 0.43 | 0.53 | 0.47 |
+
+On held-out data, the ranking fix accounts for nearly all of the gain:
+salience no longer outranks relevance. BM25 fusion adds a little at
+R@5 and nothing at R@1. The bigger hybrid gains on the tuning set came
+partly from tuning.
+
 ## Conflict flags
 
 When sleep writes a semantic entry that is near-identical (cosine 0.85

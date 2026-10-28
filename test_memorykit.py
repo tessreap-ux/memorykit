@@ -568,6 +568,36 @@ def run_mode(mode):
           "the" not in toks and "is" not in toks
           and {"not", "without", "never"} <= set(toks), toks)
 
+    # 12d. Attribution: who said it vs. who they quoted.
+    k.fresh()
+    mk.AUTO = False
+    qa, _, _ = k.cap("tool", "I agree with that, and the bridge toll should stay at five.",
+                     "--source", "Ada", "--quote", "The bridge toll doubles in spring.",
+                     "--quote-source", "Ben")
+    k.cap("tool", "The bridge toll doubles in spring.", "--source", "Ben")
+    _, out, _ = k.run("search", "--query", "bridge toll doubles in spring", "--limit", "1")
+    check("attribution: quoted words are found under their original speaker",
+          out.strip().split()[1] == "fact@Ben", out.strip()[:60])
+    _, out, _ = k.run("search", "--query", "bridge toll", "--source", "ada")
+    check("attribution: --source filters by speaker",
+          qa["id"][:10] in out and "@Ben" not in out, out.strip()[:80])
+    k.run("sleep", "--apply", "--no-sweep", "--min-salience", "1")
+    sem = k.sql("SELECT metadata FROM memory_item WHERE project='semantic'")
+    check("attribution: source survives distillation",
+          sorted(json.loads(m[0]).get("source") for m in sem) == ["Ada", "Ben"], sem)
+    md = json.loads(k.sql("SELECT metadata FROM memory_item WHERE id=?", (qa["id"],))[0][0])
+    check("attribution: quote kept in metadata, out of indexed content",
+          md["quote"] == {"source": "Ben", "text": "The bridge toll doubles in spring."}
+          and "doubles" not in k.sql("SELECT content FROM memory_item WHERE id=?", (qa["id"],))[0][0])
+    before = k.sql("SELECT id, metadata FROM memory_item ORDER BY id")
+    k.run("reindex", "--force")
+    after = k.sql("SELECT id, metadata FROM memory_item ORDER BY id")
+    src = lambda rows: [(i, json.loads(m).get("source"), json.loads(m).get("quote")) for i, m in rows]
+    ids = {i for i, _ in before}  # the log also holds earlier sections' rows
+    after = [x for x in after if x[0] in ids]
+    check("attribution: source and quote survive a rebuild from the log", src(before) == src(after),
+          (len(before), len(after), [x for x in src(after) if x not in src(before)][:2]))
+
     # 13. Token economy: every byte printed is paid for by the reader.
     k.fresh()
     mk.AUTO = False

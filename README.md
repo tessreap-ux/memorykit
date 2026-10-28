@@ -88,6 +88,8 @@ Output is terse by default because readers pay for it in tokens; see
 "Token economy" in DESIGN.md. `MEMORYKIT_VERBOSE=1` turns chatter back on.
 Ids print short; any unique prefix of 6+ characters works as an id.
 `get --text` prints just an entry's words.
+Attribution: `capture --source NAME [--quote TEXT --quote-source NAME]`;
+`search --source NAME`. Quotes are kept out of the indexed text.
 Tuning: `MEMORYKIT_SETTLE_TURNS` (8), `MEMORYKIT_SLEEP_MIN_HITS` (2),
 `MEMORYKIT_SNIPPET_CHARS` (200), `MEMORYKIT_CONFLICT_SIM` (0.85), `MEMORYKIT_SWEEP_EVERY` (50),
 `MEMORYKIT_SLEEP_MIN_SALIENCE` (5), `MEMORYKIT_DISTILLER`.
