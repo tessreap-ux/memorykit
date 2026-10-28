@@ -546,9 +546,27 @@ def run_mode(mode):
     check("tiny store: a one-entry store finds its entry", one["id"][:10] in out, out.strip()[:80])
     two, _, _ = k.cap("user", "The orchard ladder is kept behind the cider press.")
     _, out, _ = k.run("search", "--query", "where is the orchard ladder kept", "--limit", "5")
-    check("tiny store: the weaker of two matches is still returned",
-          two["id"][:10] in out and one["id"][:10] in out
-          and out.index(two["id"][:10]) < out.index(one["id"][:10]), out.strip()[:120])
+    if mode == "vector":
+        check("tiny store: the weaker of two matches is still returned",
+              two["id"][:10] in out and one["id"][:10] in out
+              and out.index(two["id"][:10]) < out.index(one["id"][:10]), out.strip()[:120])
+    else:
+        # The harbor entry shares only "the" with this query. With stopwords
+        # removed that is no evidence, so keyword mode must not return it.
+        check("tiny store: keyword mode returns the match, not a 'the'-only row",
+              two["id"][:10] in out and one["id"][:10] not in out, out.strip()[:120])
+
+    # 12c. Stopwords: "the" is not evidence; negations still are.
+    rc, out, _ = k.run("search", "--query", "the of and it is")
+    if mode == "keyword":
+        check("stopwords: all-stopword query returns no matches, no crash",
+              out.strip() == "(no matches)", out.strip()[:80])
+    else:
+        check("stopwords: all-stopword query does not crash in vector mode", rc in (0, None))
+    toks = mk._tokens("The ladder is NOT kept without a lock, never")
+    check("stopwords: function words dropped, negations kept",
+          "the" not in toks and "is" not in toks
+          and {"not", "without", "never"} <= set(toks), toks)
 
     # 13. Token economy: every byte printed is paid for by the reader.
     k.fresh()

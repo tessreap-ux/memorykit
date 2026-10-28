@@ -112,10 +112,18 @@ share wording with the answer, 12 pure paraphrases):
 | old: sim x salience | 0.12 | 0.08 |
 | pure cosine | 0.71 | 0.67 |
 | new hybrid | 0.92 | 0.67 |
-| keyword mode, BM25 | 0.92 | 0.17 |
+| keyword mode, BM25 + stopwords | 0.96 | 0.08 |
 
 These are small, hand-written query sets, so treat them as direction,
-not proof. A known weak spot: in keyword mode, BM25's length
+not proof. Lexical matching drops common function words (STOPWORDS) from queries
+and documents alike. Negations stay, because they change meaning. A
+query made only of stopwords finds nothing in keyword mode instead of
+everything. With stopwords removed, keyword-mode paraphrase recall is an
+honest 0.08. The earlier 0.17 was partly lucky "the" matches. In vector
+mode, nearly every row has some cosine, so the tail of a result list can
+be unrelated. Ordering is right, and `--limit` and `--budget` cap the
+cost. A raw-similarity floor would trim it if that's wanted.
+A known weak spot: in keyword mode, BM25's length
 normalization lets a long entry rank below short ones that share common
 words. Run `bench` on your own corpus before tuning anything. Keyword mode can't do paraphrase; install the embedder if
 that matters.

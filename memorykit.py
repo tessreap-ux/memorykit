@@ -505,8 +505,26 @@ def cmd_capture(args):
 _TOK = re.compile(r"\w+")
 
 
+# Function words that appear in nearly every entry. They carry no lexical
+# evidence and only dilute BM25. Negations are deliberately NOT here:
+# "not", "never", "no", "without" change meaning, and value_change() and
+# the conflict flags depend on them.
+STOPWORDS = frozenset("""
+a an the and or but if then so of to in on at by for from with as into onto
+over under about after before between through during is am are was were be
+been being do does did doing have has had having it its this that these those
+there here i me my mine we us our you your he him his she her they them their
+what which who whom whose when where why how all any each both few more most
+other some such only own same than too very can will just should would could
+may might must shall also up down out off again once s t ll d re ve m
+""".split())
+
+
 def _tokens(text):
-    return [t for t in _TOK.findall((text or "").lower()) if len(t) > 1]
+    """Lexical tokens: lowercase words, 2+ chars, stopwords removed. Used for
+    both queries and documents, so they always agree."""
+    return [t for t in _TOK.findall((text or "").lower())
+            if len(t) > 1 and t not in STOPWORDS]
 
 
 def _bm25(query_toks, docs, k1=1.2, b=0.75):
