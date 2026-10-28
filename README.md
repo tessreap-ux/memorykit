@@ -70,6 +70,8 @@ python3 memorykit.py correlate --markdown MEMORY.md
 | `correlate` | Audit curated markdown claims against the index; orphans reported, never deleted. Vector mode uses a cosine cutoff of 0.75 (`MEMORYKIT_CORRELATE_COS`), keyword mode 0.3 token overlap. |
 | `feedback` | `--id ID --rating +1\|-1 [--comment]`. Feeds the U term in GC. |
 | `promote` | `--id NOTE --evidence ID`. Turns a note into a fact only on a different, live, user-said or tool-observed entry that is not derived from the note. |
+| `sleep` | Distill settled raw turns into semantic entries, verify, wipe, sweep. Dry run by default; `--apply`, `--settled-only`, `--distiller CMD`, `--no-sweep`. Runs automatically on capture when `MEMORYKIT_AUTO=1` (default). |
+| `end-session` | `--session S`. Closes a session; its turns settle and distill immediately. |
 | `reindex` | Delete-and-rebuild the database from the markdown log alone (`--force` to replace an existing DB). |
 
 Options: `--db PATH` (default `memory.db`, or the `MEMORYKIT_DB`
@@ -78,7 +80,10 @@ state:foo` (auto-retires prior versions with the same key),
 `--parent-ids` (writes `derived_from` edges for cascade pruning),
 `--check` (advisory contradiction search before capture),
 `--protected` (exempt from GC and from cascade quarantine).
-`MEMORYKIT_NO_EMBED=1` forces keyword mode.
+`MEMORYKIT_NO_EMBED=1` forces keyword mode. `--no-auto` on capture
+skips the settled-turn check once; `MEMORYKIT_AUTO=0` turns it off.
+Tuning: `MEMORYKIT_SETTLE_TURNS` (8), `MEMORYKIT_SWEEP_EVERY` (50),
+`MEMORYKIT_SLEEP_MIN_SALIENCE` (5), `MEMORYKIT_DISTILLER`.
 
 ## Rebuilding
 

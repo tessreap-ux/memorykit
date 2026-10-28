@@ -144,6 +144,49 @@ Auto-restore-on-regression is deliberately NOT implemented: no
 reliable "reasoning regression" signal exists. Manual `--restore`
 instead of a fake automatic one.
 
+## Sleep: distillation triggered by function, not by clock
+
+Raw turns are working memory. Once a turn has *settled*, it is distilled
+into one semantic entry and the raw turn is wiped. Nothing runs on a
+timer; the triggers are events:
+
+- **Settled by distance:** a turn has left the working window once
+  `MEMORYKIT_SETTLE_TURNS` (default 8) newer raw turns exist. A quick
+  follow-up correction is no longer likely, so it's safe to distill.
+- **Settled by closure:** `end-session --session S` settles every turn
+  in that session at once.
+- **Sweep by volume:** gc + dedup run after every
+  `MEMORYKIT_SWEEP_EVERY` (default 50) distills.
+
+With `MEMORYKIT_AUTO=1` (default) every capture checks for settled turns
+and distills only those, so with the default verbatim distiller the
+store stays distilled turn by turn. `sleep --apply` is the manual flush
+(all eligible turns, optionally `--min-age-hours`); `--settled-only`
+applies the same rule as auto.
+
+Order, every time: **collect → distill → verify → wipe → sweep.**
+
+- Turns below `MEMORYKIT_SLEEP_MIN_SALIENCE` (default 5) are not
+  distilled; GC handles them.
+- Distillation is 1:1: one live turn plus whatever it already superseded
+  becomes one entry, linked by `distilled_from` edges. Those edges are
+  not `derived_from`, so wiping a turn never cascades into its entry.
+- The kit sets provenance, never the distiller: user-said or
+  tool-observed → fact; agent → note. An optional `--distiller` command
+  (or `MEMORYKIT_DISTILLER`) may rewrite the *text* only: JSON turns on
+  stdin, `{"text": ...}` out. If it fails, the turn stays live.
+- Wipe refuses unless the parent entry is live and every turn is linked
+  to it. Wipe is a reversible tombstone, logged as `op: wipe` after it
+  succeeds, so `reindex` keeps wiped turns wiped.
+- A correction aimed at a wiped turn is redirected to its semantic
+  entry, and supersession keys carry over, so distilled facts can still
+  be corrected exactly.
+- Crash safety: every step is idempotent. If a run dies after writing
+  the entry but before the wipe, the next run finds the entry by its
+  edge, re-logs it, and only wipes. If the wipe's log line was lost, a
+  reindex revives the turn and the next run wipes it again. A lock file
+  stops two runs from overlapping.
+
 ## Cross-layer audit (correlate)
 
 Every curated-markdown claim is checked against the vector index:

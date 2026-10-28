@@ -38,12 +38,15 @@ Usage:
   python3 memorykit.py feedback --id ID --rating +1|-1 [--comment "..."]
   python3 memorykit.py promote --id NOTE_ID --evidence EVIDENCE_ID
   python3 memorykit.py reindex [--md-dir DIR] [--force]
+  python3 memorykit.py sleep [--apply] [--min-age-hours H] [--distiller CMD]
 
 Every capture and state change is also appended to ./memory-log/YYYY-MM-DD.md
 (override with MEMORYKIT_MD_DIR), which is what `reindex` rebuilds from.
 """
 import argparse
+import contextlib
 import datetime
+import io
 import difflib
 import json
 import math
@@ -104,6 +107,20 @@ GC_NOISE_FLOOR = 0.05
 CORRELATE_KEYWORD_MIN = 0.3
 CORRELATE_COSINE_MIN = float(os.environ.get("MEMORYKIT_CORRELATE_COS", "0.75"))
 GC_QUARANTINE_DAYS = 30
+# Sleep (nightly distill): raw turns at or above this salience are distilled
+# into semantic entries and then wiped; below it they are left for GC.
+SLEEP_MIN_SALIENCE = int(os.environ.get("MEMORYKIT_SLEEP_MIN_SALIENCE", "5"))
+SEMANTIC_PROJECT = "semantic"
+# Function-based triggers (no clock). With MEMORYKIT_AUTO=1 (default) every
+# capture checks whether any raw turn has SETTLED, and distills just those:
+#   * its session was closed with `end-session`, or
+#   * SETTLE_TURNS newer captures have arrived since it (it has left the
+#     working window, so a quick follow-up correction is no longer likely).
+# A sweep (gc + dedup) runs after every SWEEP_EVERY distills, not nightly.
+AUTO = os.environ.get("MEMORYKIT_AUTO", "1") == "1"
+SETTLE_TURNS = int(os.environ.get("MEMORYKIT_SETTLE_TURNS", "8"))
+SWEEP_EVERY = int(os.environ.get("MEMORYKIT_SWEEP_EVERY", "50"))
+AUTO_DISTILLER = os.environ.get("MEMORYKIT_DISTILLER", "")
 # Half-lives in days, by entry type (low-salience turns decay fastest).
 HALF_LIFE = {"fact": 180, "note": 30, "rule": 365}
 LOW_SALIENCE_HALF_LIFE = 7
@@ -155,6 +172,21 @@ def connect(db_path):
     db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row
     return db
+
+
+def state_get(db, key, default=None):
+    db.execute("CREATE TABLE IF NOT EXISTS memorykit_state "
+               "(key TEXT PRIMARY KEY, value TEXT)")
+    r = db.execute("SELECT value FROM memorykit_state WHERE key=?",
+                   (key,)).fetchone()
+    return json.loads(r[0]) if r else default
+
+
+def state_set(db, key, value):
+    db.execute("CREATE TABLE IF NOT EXISTS memorykit_state "
+               "(key TEXT PRIMARY KEY, value TEXT)")
+    db.execute("INSERT OR REPLACE INTO memorykit_state VALUES (?, ?)",
+               (key, json.dumps(value)))
 
 
 def init_db(db_path):
@@ -381,7 +413,19 @@ def cmd_capture(args):
          salience, confidence, json.dumps(metadata),
          json.dumps(vecs[0]) if vecs else None, now, now, now))
     retired = []
-    for old_id in metadata.get("supersedes", []):
+    targets = list(metadata.get("supersedes", []))
+    for old_id in list(targets):
+        # A correction aimed at a raw turn that sleep already distilled must
+        # also retire the semantic entry that now carries that fact.
+        r = db.execute("SELECT metadata FROM memory_item WHERE id=?",
+                       (old_id,)).fetchone()
+        try:
+            into = json.loads(r["metadata"] or "{}").get("distilled_into") if r else None
+        except json.JSONDecodeError:
+            into = None
+        if into and into not in targets:
+            targets.append(into)
+    for old_id in targets:
         db.execute("UPDATE memory_item SET superseded_by=? WHERE id=?",
                    (new_id, old_id))
         tombstone(db, old_id, f"superseded by {new_id}", at=now)
@@ -420,6 +464,8 @@ def cmd_capture(args):
         f"[{provenance}] {text}")
     print(f"saved id={new_id} provenance={provenance} "
           f"salience={salience} confidence={confidence}")
+    if AUTO and not _REPLAYING and not getattr(args, "no_auto", False):
+        auto_sleep(args.db)
     if vecs is None:
         print("note: no embedder installed — entry stored without a vector; "
               "run `backfill` after installing one "
@@ -852,6 +898,314 @@ def cmd_promote(args):
     return 0
 
 
+# ---------------------------------------------------------------- sleep
+#
+# The nightly distill ("synthetic sleep"):
+#   1. collect  live raw turns (project != semantic) older than --min-age-hours
+#   2. distill  each turn at/above SLEEP_MIN_SALIENCE into ONE semantic entry,
+#               linked to the turn and its superseded predecessors by
+#               `distilled_from` edges (not `derived_from`, so wiping a turn
+#               never cascades into the entry built from it)
+#   3. verify   the semantic entry exists and is live, then
+#   4. wipe     the consumed turns (reversible tombstone, logged as op=wipe)
+#   5. sweep    gc --apply, then dedup --apply
+#
+# Distillation is 1:1 (one live turn, plus whatever it already superseded,
+# becomes one entry). That keeps corrections exact: a later correction aimed
+# at a wiped turn is redirected to the entry that carries its fact.
+#
+# Provenance is computed by the kit, never by the distiller: the entry is a
+# fact only if the live turn is user-said or tool-observed, else a note.
+#
+# Crash safety: every step is idempotent. If a run dies after writing the
+# entry but before the wipe, the next run finds the existing entry (by its
+# distilled_from edge) and only wipes. If the wipe happened but its log line
+# did not, a reindex brings the turn back and the next run wipes it again.
+
+def _body(content):
+    return re.sub(r"^\[turn provenance=[^\]]*\]\n", "", content or "")
+
+
+def _run_distiller(cmd, payload):
+    """Optional external distiller: JSON on stdin, JSON {"text": ...} out.
+
+    Anything it returns is text only. It cannot set provenance, type,
+    confidence, or which turns get wiped."""
+    import subprocess
+    res = subprocess.run(cmd, shell=True, input=json.dumps(payload),
+                         capture_output=True, text=True, timeout=300)
+    if res.returncode != 0:
+        raise RuntimeError(f"distiller exit {res.returncode}: {res.stderr[:200]}")
+    out = json.loads(res.stdout)
+    text = (out.get("text") or "").strip()
+    if len(text) < 10:
+        raise RuntimeError("distiller returned empty text")
+    return text
+
+
+def insert_semantic(db, db_path, eid, at, text, provenance, salience, turns,
+                    supersession_key="", protected=False):
+    if db.execute("SELECT 1 FROM memory_item WHERE id=?", (eid,)).fetchone():
+        return  # idempotent: replay or a re-logged record
+    mtype, confidence = PROVENANCE[provenance]
+    md = {"provenance": provenance, "captured_at": at, "distilled": True,
+          "distilled_from": turns, "salience_reason": "inherited"}
+    if supersession_key:
+        md["supersession_key"] = supersession_key
+    if protected:
+        md["protected"] = True
+    vecs = embed_texts([text[:4000]])
+    db.execute(
+        """INSERT INTO memory_item
+           (id, created, updated, project, session_key, type, content,
+            salience, confidence, metadata, embedding, status,
+            valid_from, learned_at, last_accessed_at)
+           VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, ?)""",
+        (eid, at, at, SEMANTIC_PROJECT, mtype,
+         f"[turn provenance={provenance}]\n{text}", salience, confidence,
+         json.dumps(md), json.dumps(vecs[0]) if vecs else None, at, at, at))
+    for t in turns:
+        db.execute(
+            "INSERT INTO memory_edge (id, created, updated, project, subject_id,"
+            " predicate, object_id, source_id) VALUES (?, ?, ?, ?, ?,"
+            " 'distilled_from', ?, ?)",
+            (uuid.uuid4().hex[:24], at, at, SEMANTIC_PROJECT, eid, t, eid))
+
+
+def wipe_turns(db, parent, turns, at):
+    """Tombstone consumed turns. Refuses unless the parent is live and every
+    turn is linked to it by a distilled_from edge. Never cascades."""
+    p = db.execute("SELECT status, superseded_by FROM memory_item WHERE id=?",
+                   (parent,)).fetchone()
+    if not p or p["status"] == "rejected" or p["superseded_by"]:
+        raise RuntimeError(f"refusing wipe: parent {parent} is not live")
+    linked = {r["object_id"] for r in db.execute(
+        "SELECT object_id FROM memory_edge WHERE subject_id=? AND "
+        "predicate='distilled_from'", (parent,)).fetchall()}
+    missing = [t for t in turns if t not in linked]
+    if missing:
+        raise RuntimeError(f"refusing wipe: {missing} not distilled into {parent}")
+    wiped = []
+    for t in turns:
+        r = db.execute("SELECT status, metadata FROM memory_item WHERE id=?",
+                       (t,)).fetchone()
+        if not r:
+            continue
+        md = json.loads(r["metadata"] or "{}")
+        md["distilled_into"] = parent
+        if r["status"] != "rejected":
+            md["tombstoned_at"] = at
+            md["tombstone_reason"] = f"distilled into {parent}"
+            wiped.append(t)
+        db.execute("UPDATE memory_item SET status='rejected', metadata=?, "
+                   "updated=? WHERE id=?", (json.dumps(md), at, t))
+    return wiped
+
+
+def _predecessors(db, tid):
+    out, frontier = [], [tid]
+    while frontier:
+        cur = frontier.pop()
+        for r in db.execute("SELECT id FROM memory_item WHERE superseded_by=?",
+                            (cur,)).fetchall():
+            if r["id"] not in out:
+                out.append(r["id"])
+                frontier.append(r["id"])
+    return out
+
+
+def is_settled(db, t):
+    """A raw turn is settled when its session closed, or when SETTLE_TURNS
+    newer raw captures exist. Function, not clock."""
+    ended = set(state_get(db, "ended_sessions", []))
+    if t["session_key"] and t["session_key"] in ended:
+        return True
+    newer = db.execute(
+        "SELECT COUNT(*) FROM memory_item WHERE project != ? AND learned_at > ?",
+        (SEMANTIC_PROJECT, t["learned_at"])).fetchone()[0]
+    return newer >= SETTLE_TURNS
+
+
+def auto_sleep(db_path):
+    """Called after every capture. Distills only settled turns; sweeps on
+    distill count. Quiet unless it did something. Never raises."""
+    try:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cmd_sleep(argparse.Namespace(
+                db=db_path, apply=True, min_age_hours=0.0,
+                min_salience=SLEEP_MIN_SALIENCE, distiller=AUTO_DISTILLER,
+                no_sweep=True, settled_only=True, quiet_lock=True))
+        line = out.getvalue().strip().splitlines()
+        summary = line[-1] if line else ""
+        m = re.search(r"distilled (\d+)", summary)
+        n = int(m.group(1)) if m else 0
+        if n:
+            print(f"auto-sleep: {summary.replace('sleep: ', '')}")
+            db = connect(db_path)
+            since = state_get(db, "distills_since_sweep", 0) + n
+            state_set(db, "distills_since_sweep", since)
+            db.commit()
+            db.close()
+            if since >= SWEEP_EVERY:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    cmd_gc(argparse.Namespace(db=db_path, apply=True,
+                                              restore="", eviction_report=False))
+                    cmd_dedup(argparse.Namespace(db=db_path, apply=True))
+                db = connect(db_path)
+                state_set(db, "distills_since_sweep", 0)
+                db.commit()
+                db.close()
+                print("auto-sweep: gc + dedup applied")
+        return rc
+    except Exception as e:
+        print(f"auto-sleep skipped: {e}", file=sys.stderr)
+        return 0
+
+
+def cmd_end_session(args):
+    """Close a session: its turns become settled and are distilled now."""
+    db = connect(args.db)
+    ended = state_get(db, "ended_sessions", [])
+    if args.session not in ended:
+        ended.append(args.session)
+    state_set(db, "ended_sessions", ended)
+    db.commit()
+    db.close()
+    log_md(args.db, {"op": "end_session", "session": args.session},
+           f"end session {args.session}")
+    print(f"session {args.session} closed")
+    if not _REPLAYING:
+        return cmd_sleep(argparse.Namespace(
+            db=args.db, apply=True, min_age_hours=0.0,
+            min_salience=SLEEP_MIN_SALIENCE, distiller=AUTO_DISTILLER,
+            no_sweep=True, settled_only=True))
+    return 0
+
+
+def cmd_sleep(args):
+    lock = args.db + ".sleep.lock"
+    if args.apply:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+        except FileExistsError:
+            if not getattr(args, "quiet_lock", False):
+                print(f"another sleep run holds {lock}; remove it if stale",
+                      file=sys.stderr)
+            return 3
+    try:
+        return _sleep(args)
+    finally:
+        if args.apply and os.path.exists(lock):
+            os.remove(lock)
+
+
+def _sleep(args):
+    db = connect(args.db)
+    nowdt = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = (nowdt - datetime.timedelta(hours=args.min_age_hours)).isoformat()
+    turns = db.execute(
+        "SELECT * FROM memory_item WHERE status != 'rejected' AND "
+        "superseded_by IS NULL AND project != ? AND learned_at <= ? "
+        "ORDER BY learned_at", (SEMANTIC_PROJECT, cutoff)).fetchall()
+    if getattr(args, "settled_only", False):
+        # One pass instead of a COUNT per turn: a turn is in the working
+        # window if it is among the newest SETTLE_TURNS raw captures.
+        stamps = [r[0] for r in db.execute(
+            "SELECT learned_at FROM memory_item WHERE project != ? "
+            "ORDER BY learned_at DESC LIMIT ?",
+            (SEMANTIC_PROJECT, SETTLE_TURNS)).fetchall()]
+        floor = stamps[-1] if len(stamps) >= SETTLE_TURNS else None
+        ended = set(state_get(db, "ended_sessions", []))
+        turns = [t for t in turns
+                 if (t["session_key"] and t["session_key"] in ended)
+                 or (floor is not None and t["learned_at"] < floor)]
+    distilled = wiped = skipped = reused = errors = 0
+    for t in turns:
+        md = json.loads(t["metadata"] or "{}")
+        if t["salience"] < args.min_salience and not md.get("protected"):
+            skipped += 1
+            continue
+        group = [t["id"]] + _predecessors(db, t["id"])
+        existing = db.execute(
+            "SELECT e.subject_id FROM memory_edge e JOIN memory_item m "
+            "ON m.id = e.subject_id WHERE e.object_id=? AND "
+            "e.predicate='distilled_from' AND m.status != 'rejected' AND "
+            "m.superseded_by IS NULL", (t["id"],)).fetchone()
+        prov = md.get("provenance", "agent-said")
+        if prov not in PROVENANCE:
+            prov = "agent-said"
+        if not args.apply:
+            print(f"would distill {t['id']} ({prov}, sal={t['salience']}, "
+                  f"{len(group)} turn(s)){' [reuse]' if existing else ''}")
+            distilled += 0 if existing else 1
+            continue
+        try:
+            at = now_iso()
+            if existing:
+                parent = existing["subject_id"]
+                reused += 1
+                # The entry may have been committed by a run that died before
+                # logging it. Re-log it so the markdown can rebuild it (replay
+                # of a duplicate record is a no-op).
+                er = db.execute("SELECT * FROM memory_item WHERE id=?",
+                                (parent,)).fetchone()
+                emd = json.loads(er["metadata"] or "{}")
+                log_md(args.db, {"op": "distill", "id": parent,
+                                 "at": er["learned_at"], "text": _body(er["content"]),
+                                 "provenance": emd.get("provenance", prov),
+                                 "salience": er["salience"],
+                                 "turns": emd.get("distilled_from", group),
+                                 "supersession_key": emd.get("supersession_key", ""),
+                                 "protected": bool(emd.get("protected")),
+                                 "relogged": True},
+                       f"[distilled, re-logged] {_body(er['content'])}")
+            else:
+                text = _body(t["content"])
+                if args.distiller:
+                    text = _run_distiller(args.distiller, {
+                        "turns": [{"id": g, "text": _body(db.execute(
+                            "SELECT content FROM memory_item WHERE id=?",
+                            (g,)).fetchone()["content"])} for g in group],
+                        "provenance": prov})
+                parent = uuid.uuid4().hex[:24]
+                insert_semantic(db, args.db, parent, at, text, prov,
+                                t["salience"], group,
+                                md.get("supersession_key", ""),
+                                bool(md.get("protected")))
+                db.commit()
+                log_md(args.db, {"op": "distill", "id": parent, "at": at,
+                                 "text": text, "provenance": prov,
+                                 "salience": t["salience"], "turns": group,
+                                 "supersession_key": md.get("supersession_key", ""),
+                                 "protected": bool(md.get("protected"))},
+                       f"[distilled {prov}] {text}")
+                distilled += 1
+            # verify, then wipe
+            at2 = now_iso()
+            done = wipe_turns(db, parent, group, at2)
+            db.commit()
+            log_md(args.db, {"op": "wipe", "parent": parent, "turns": group,
+                             "at": at2}, f"wipe {len(done)} turn(s) into {parent}")
+            wiped += len(done)
+        except Exception as e:
+            db.rollback()
+            errors += 1
+            print(f"ERROR on {t['id']}: {e} (turn left live; rerun is safe)",
+                  file=sys.stderr)
+    db.close()
+    verb = "distilled" if args.apply else "would distill"
+    print(f"sleep: {verb} {distilled}, reused {reused}, wiped {wiped}, "
+          f"left for gc {skipped}, errors {errors}")
+    if args.apply and not args.no_sweep:
+        cmd_gc(argparse.Namespace(db=args.db, apply=True, restore="",
+                                  eviction_report=False))
+        cmd_dedup(argparse.Namespace(db=args.db, apply=True))
+    return 1 if errors else 0
+
+
 def cmd_reindex(args):
     """Rebuild the database from the markdown log alone.
 
@@ -944,6 +1298,30 @@ def cmd_reindex(args):
                 cmd_promote(argparse.Namespace(
                     db=args.db, id=rec["id"], evidence=rec["evidence"],
                     force_at=rec["at"]))
+            elif op == "distill":
+                db = connect(args.db)
+                insert_semantic(db, args.db, rec["id"], rec["at"], rec["text"],
+                                rec["provenance"], rec["salience"], rec["turns"],
+                                rec.get("supersession_key", ""),
+                                rec.get("protected", False))
+                db.commit()
+                db.close()
+            elif op == "end_session":
+                db = connect(args.db)
+                ended = state_get(db, "ended_sessions", [])
+                if rec["session"] not in ended:
+                    ended.append(rec["session"])
+                state_set(db, "ended_sessions", ended)
+                db.commit()
+                db.close()
+            elif op == "wipe":
+                db = connect(args.db)
+                try:
+                    wipe_turns(db, rec["parent"], rec["turns"], rec["at"])
+                    db.commit()
+                except RuntimeError as e:
+                    print(f"replay: {e}", file=sys.stderr)
+                db.close()
     finally:
         _REPLAYING = False
     print(f"reindexed {len(records)} record(s) from {len(files)} file(s): "
@@ -973,6 +1351,8 @@ def main():
     p.add_argument("--project", default="turns")
     p.add_argument("--protected", action="store_true",
                    help="exempt from GC and from cascade quarantine")
+    p.add_argument("--no-auto", action="store_true",
+                   help="skip the settled-turn distill check for this capture")
     p.set_defaults(fn=cmd_capture)
 
     p = sub.add_parser("search")
@@ -1015,6 +1395,23 @@ def main():
     p.add_argument("--md-dir", default="")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_reindex)
+
+    p = sub.add_parser("sleep",
+                       help="nightly distill: collect, distill, verify, wipe, sweep")
+    p.add_argument("--apply", action="store_true", help="default is a dry run")
+    p.add_argument("--min-age-hours", type=float, default=0.0,
+                   help="only consume turns at least this old")
+    p.add_argument("--min-salience", type=int, default=SLEEP_MIN_SALIENCE)
+    p.add_argument("--distiller", default="",
+                   help="optional command: JSON turns on stdin, {\"text\"} out")
+    p.add_argument("--no-sweep", action="store_true")
+    p.add_argument("--settled-only", action="store_true",
+                   help="only consume turns that have settled (see AUTO)")
+    p.set_defaults(fn=cmd_sleep)
+
+    p = sub.add_parser("end-session")
+    p.add_argument("--session", required=True)
+    p.set_defaults(fn=cmd_end_session)
 
     p = sub.add_parser("backfill")
     p.set_defaults(fn=cmd_backfill)

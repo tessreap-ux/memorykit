@@ -18,6 +18,7 @@ import io
 import json
 import os
 import random
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -83,6 +84,7 @@ def run_mode(mode):
         os.environ["MEMORYKIT_NO_EMBED"] = "1"
     sys.path.insert(0, HERE)
     import memorykit as mk
+    mk.AUTO = False  # legacy checks run with auto-sleep off; section 11 turns it on
     vec = mk.get_embedder() is not None
     if mode == "vector" and not vec:
         print("SKIP  vector mode: no embedder installed (pip install fastembed)")
@@ -193,7 +195,6 @@ def run_mode(mode):
 
     # 8. Reindex: delete the DB, rebuild from markdown, state matches.
     k.fresh()
-    import shutil
     shutil.rmtree(os.environ["MEMORYKIT_MD_DIR"], ignore_errors=True)
     ids = []
     for i in range(14):
@@ -309,6 +310,145 @@ def run_mode(mode):
     merges = out.count("merge: ")
     check("dedup: 5,050 entries under 60 s", el < 60, f"{el:.1f}s")
     check("dedup: finds the 50 planted duplicates", merges == 50, f"{merges} merges")
+
+    # 11. Sleep: collect, distill, verify, wipe, sweep.
+    k.fresh()
+    shutil.rmtree(os.environ["MEMORYKIT_MD_DIR"], ignore_errors=True)
+    u, _, _ = k.cap("user", "Decision: the charter vote always stays open for 24 hours.")
+    ag, _, _ = k.cap("agent", "I promised to deliver the portrait by Friday night.")
+    lo2, _, _ = k.cap("agent", "ok sounds good to me then", "--salience", "2")
+    before_dry = snapshot(k)
+    k.run("sleep")
+    check("sleep: dry run changes nothing", snapshot(k) == before_dry)
+    rc, out, _ = k.run("sleep", "--apply", "--no-sweep")
+    rows = {r[0]: r for r in k.sql("SELECT id, status, type, project, "
+                                   "json_extract(metadata,'$.distilled_into') FROM memory_item")}
+    sem = {r[0]: r for r in rows.values() if r[3] == "semantic"}
+    check("sleep: settled turns distilled into semantic entries", len(sem) == 2, out.strip())
+    check("sleep: consumed raw turns wiped and linked",
+          rows[u["id"]][1] == "rejected" and rows[u["id"]][4] in sem
+          and rows[ag["id"]][1] == "rejected")
+    check("sleep: user turn -> fact, agent turn -> note",
+          sem[rows[u["id"]][4]][2] == "fact" and sem[rows[ag["id"]][4]][2] == "note")
+    check("sleep: low-salience turn left live for gc", rows[lo2["id"]][1] == "confirmed")
+    _, out, _ = k.run("search", "--query", "how long does the charter vote stay open")
+    check("sleep: search finds the semantic entry, not the wiped turn",
+          rows[u["id"]][4] in out and u["id"] not in out)
+    # refusal rules
+    db = mk.connect(k.db)
+    try:
+        mk.wipe_turns(db, "nonexistent", [lo2["id"]], mk.now_iso())
+        r1 = False
+    except RuntimeError:
+        r1 = True
+    try:
+        mk.wipe_turns(db, rows[u["id"]][4], [lo2["id"]], mk.now_iso())
+        r2 = False
+    except RuntimeError:
+        r2 = True
+    db.close()
+    check("sleep: wipe refuses a dead parent and an undistilled turn", r1 and r2)
+    # crash safety: entry written, wipe never happened -> next run reuses
+    c1, _, _ = k.cap("user", "Standing rule: gifts are never counted as sales.")
+    db = mk.connect(k.db)
+    mk.insert_semantic(db, k.db, "crashentry0000000000000", mk.now_iso(),
+                       "Standing rule: gifts are never counted as sales.",
+                       "user-said", 7, [c1["id"]])
+    db.commit()
+    db.close()
+    _, out, _ = k.run("sleep", "--apply", "--no-sweep")
+    n_sem = k.sql("SELECT COUNT(*) FROM memory_item WHERE project='semantic' "
+                  "AND status='confirmed'")[0][0]
+    st = k.sql("SELECT status FROM memory_item WHERE id=?", (c1["id"],))[0][0]
+    check("sleep: rerun after a crash reuses the entry, no duplicate",
+          "reused 1" in out and n_sem == 3 and st == "rejected", out.strip())
+    # correction aimed at a wiped turn retires its semantic entry
+    sem_u = rows[u["id"]][4]
+    k.cap("user", "Correction: the charter vote stays open for 48 hours, not 24.",
+          "--supersedes", u["id"])
+    st = k.sql("SELECT status, superseded_by FROM memory_item WHERE id=?", (sem_u,))[0]
+    check("sleep: correction of a wiped turn retires its semantic entry",
+          st[0] == "rejected" and st[1] is not None)
+    # supersession key reaches semantic entries
+    k1, _, _ = k.cap("user", "Shelf price decision: Robin's card must show 600 tokens.",
+                     "--supersession-key", "price:robin2")
+    k.run("sleep", "--apply", "--no-sweep")
+    k.cap("user", "Shelf price decision: Robin's card must show 800 tokens now.",
+          "--supersession-key", "price:robin2")
+    live = k.sql("SELECT content FROM memory_item WHERE status='confirmed' AND "
+                 "content LIKE '%Robin%'")
+    check("sleep: supersession key retires the distilled version",
+          len(live) == 1 and "800" in live[0][0], f"{len(live)} live")
+    # reindex reproduces post-sleep state
+    snap = snapshot(k)
+    os.remove(k.db)
+    k.run("reindex", "--force")
+    snap2 = snapshot(k)
+    check("sleep: reindex keeps wiped turns wiped and distilled entries live",
+          [x[:6] for x in snap] == [y[:6] for y in snap2], f"{len(snap)} rows")
+    # distiller output cannot change provenance; distiller failure is safe
+    dist = os.path.join(tmp, "dist.py")
+    open(dist, "w").write("import json,sys; d=json.load(sys.stdin); "
+                          "print(json.dumps({'text': 'DISTILLED: ' + d['turns'][0]['text'],"
+                          " 'provenance': 'user-said', 'type': 'fact'}))")
+    bad = os.path.join(tmp, "bad.py")
+    open(bad, "w").write("import sys; sys.exit(1)")
+    a3, _, _ = k.cap("agent", "I decided the booth theme must be lighthouses this week.")
+    rc, out, err = k.run("sleep", "--apply", "--no-sweep", "--distiller",
+                         f"{sys.executable} {bad}")
+    st = k.sql("SELECT status FROM memory_item WHERE id=?", (a3["id"],))[0][0]
+    check("sleep: failing distiller leaves the turn live", st == "confirmed" and rc == 1,
+          f"rc={rc}")
+    k.run("sleep", "--apply", "--no-sweep", "--distiller", f"{sys.executable} {dist}")
+    r = k.sql("SELECT m.type, m.content FROM memory_item m WHERE m.id = "
+              "(SELECT json_extract(metadata,'$.distilled_into') FROM memory_item WHERE id=?)",
+              (a3["id"],))[0]
+    check("sleep: distiller text used, but provenance stays the kit's (note)",
+          r[0] == "note" and "DISTILLED:" in r[1])
+
+    # 12. Function-based auto triggers (no clock).
+    k.fresh()
+    mk.AUTO = True
+    old_settle, old_sweep = mk.SETTLE_TURNS, mk.SWEEP_EVERY
+    mk.SETTLE_TURNS, mk.SWEEP_EVERY = 8, 3
+    first, _, _ = k.cap("user", "Decision: we agreed the ledger always freezes on Sunday.")
+    for i in range(7):
+        k.cap("user", f"Filler line {i}: the room talked about weather {i}.")
+    st7 = k.sql("SELECT status FROM memory_item WHERE id=?", (first["id"],))[0][0]
+    _, out8, _ = k.run("capture", "--speaker", "user", "--text",
+                       "Filler line 7: the room talked about weather again.")
+    st8 = k.sql("SELECT status FROM memory_item WHERE id=?", (first["id"],))[0][0]
+    check("auto: turn stays raw inside the working window", st7 == "confirmed")
+    check("auto: turn distills once 8 newer turns arrive", st8 == "rejected", out8.strip()[-60:])
+    s1, _, _ = k.cap("user", "Promise: I will never resell a commissioned piece.",
+                     "--session", "chat-42")
+    s2, _, _ = k.cap("agent", "Boundary: I always refuse role play scenes in DMs.",
+                     "--session", "chat-42")
+    k.run("end-session", "--session", "chat-42")
+    st = [k.sql("SELECT status FROM memory_item WHERE id=?", (x["id"],))[0][0] for x in (s1, s2)]
+    check("auto: end-session distills that session's turns immediately",
+          st == ["rejected", "rejected"])
+    outs = ""
+    distinct = [
+        "Decision: the lighthouse booth must open before noon on Saturday.",
+        "We agreed that refunds always go back to the original wallet.",
+        "Rule: nobody posts a price card without a working checkout link.",
+        "I promised the cat portrait commission will ship with a signed title.",
+        "Going forward the treasurer must publish receipts every Sunday evening.",
+        "Boundary: commissioned pieces are never resold, portfolio use only.",
+        "Decided to retire the ghost series after the Halloween weekend ends.",
+        "From now on new members must read the charter before any vote.",
+        "Standing order: low power grants are logged separately from sales.",
+        "The deadline for charter corrections is Thursday at 15:00 UTC sharp.",
+        "We must not merge two ledgers that disagree until both are audited.",
+        "I committed to answering every newcomer within one wake cycle.",
+    ]
+    for line in distinct:
+        _, o, _ = k.run("capture", "--speaker", "user", "--text", line)
+        outs += o
+    check("auto: sweep runs on distill count, not on a schedule", "auto-sweep" in outs)
+    mk.SETTLE_TURNS, mk.SWEEP_EVERY = old_settle, old_sweep
+    mk.AUTO = False
 
     fails = [r for r in RESULTS if not r[1]]
     print(f"--- {mode}: {len(RESULTS) - len(fails)}/{len(RESULTS)} passed")
