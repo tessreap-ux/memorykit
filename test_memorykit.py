@@ -537,6 +537,19 @@ def run_mode(mode):
           and k.sql("SELECT value FROM memorykit_state WHERE key='distills_since_sweep'")[0][0]
           in ("0", "1", "2"))
 
+    # 12b. Tiny stores: min-max normalization must not hide the only entry
+    # (or the weakest of two). Reported by Muse against v4.
+    k.fresh()
+    mk.AUTO = False
+    one, _, _ = k.cap("user", "The harbor gate code is nine four one.")
+    _, out, _ = k.run("search", "--query", "harbor gate code")
+    check("tiny store: a one-entry store finds its entry", one["id"][:10] in out, out.strip()[:80])
+    two, _, _ = k.cap("user", "The orchard ladder is kept behind the cider press.")
+    _, out, _ = k.run("search", "--query", "where is the orchard ladder kept", "--limit", "5")
+    check("tiny store: the weaker of two matches is still returned",
+          two["id"][:10] in out and one["id"][:10] in out
+          and out.index(two["id"][:10]) < out.index(one["id"][:10]), out.strip()[:120])
+
     # 13. Token economy: every byte printed is paid for by the reader.
     k.fresh()
     mk.AUTO = False

@@ -535,8 +535,13 @@ def _bm25(query_toks, docs, k1=1.2, b=0.75):
 
 
 def _minmax(xs):
+    """Scale to 0..1 across candidates. A tie means no discrimination, not
+    no match: tied positive signals score 1.0 (a one-entry store must still
+    find its entry)."""
     lo, hi = min(xs), max(xs)
-    return [(x - lo) / (hi - lo) if hi > lo else 0.0 for x in xs]
+    if hi <= lo:
+        return [1.0 if x > 0 else 0.0 for x in xs]
+    return [(x - lo) / (hi - lo) for x in xs]
 
 
 def search_rows(db, query, limit):
@@ -575,8 +580,12 @@ def search_rows(db, query, limit):
     now = datetime.datetime.now(datetime.timezone.utc)
     scored = []
     for r, rv, lx, sm in zip(rows, rel, lex, sims):
-        if rv <= 0 or (lx <= 0 and sm <= 0):
+        # Filter on the raw signals, never on the normalized one: min-max puts
+        # the weakest candidate at 0, which would make it unreachable in a
+        # small store. A small raw-similarity term keeps it ordered.
+        if lx <= 0 and sm <= 0:
             continue
+        rv = rv + 1e-3 * max(sm, 0.0)
         try:
             accessed = datetime.datetime.fromisoformat(r["last_accessed_at"])
             age_days = max(0.0, (now - accessed).total_seconds() / 86400)
