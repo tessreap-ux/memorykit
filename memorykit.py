@@ -287,7 +287,7 @@ def is_exempt(row, md):
     return row["salience"] >= 9 or (isinstance(md, dict) and md.get("protected"))
 
 
-def tombstone(db, eid, reason, cascade=False):
+def tombstone(db, eid, reason, cascade=False, at=None):
     """Reversible soft-delete + recursive cascade prune of derived children.
 
     Exempt entries (salience >= 9 or metadata.protected) are never pulled
@@ -308,16 +308,18 @@ def tombstone(db, eid, reason, cascade=False):
         db.execute("UPDATE memory_item SET metadata=? WHERE id=?",
                    (json.dumps(md), eid))
         return
-    md["tombstoned_at"] = now_iso()
+    at = at or now_iso()
+    md["tombstoned_at"] = at
     md["tombstone_reason"] = reason
     db.execute(
         "UPDATE memory_item SET status='rejected', metadata=?, updated=? "
-        "WHERE id=?", (json.dumps(md), now_iso(), eid))
+        "WHERE id=?", (json.dumps(md), at, eid))
     children = db.execute(
         "SELECT subject_id FROM memory_edge "
         "WHERE object_id=? AND predicate='derived_from'", (eid,)).fetchall()
     for ch in children:
-        tombstone(db, ch["subject_id"], f"cascade from {eid}", cascade=True)
+        tombstone(db, ch["subject_id"], f"cascade from {eid}", cascade=True,
+                  at=at)
 
 
 # ---------------------------------------------------------------- commands
@@ -382,7 +384,7 @@ def cmd_capture(args):
     for old_id in metadata.get("supersedes", []):
         db.execute("UPDATE memory_item SET superseded_by=? WHERE id=?",
                    (new_id, old_id))
-        tombstone(db, old_id, f"superseded by {new_id}")
+        tombstone(db, old_id, f"superseded by {new_id}", at=now)
         retired.append(old_id)
     skey = metadata.get("supersession_key")
     if skey:
@@ -393,7 +395,8 @@ def cmd_capture(args):
         for p in prior:
             db.execute("UPDATE memory_item SET superseded_by=? WHERE id=?",
                        (new_id, p["id"]))
-            tombstone(db, p["id"], f"supersession key {skey} -> {new_id}")
+            tombstone(db, p["id"], f"supersession key {skey} -> {new_id}",
+                      at=now)
             retired.append(p["id"])
         if prior:
             print(f"supersession-key {skey}: retired {len(prior)} prior version(s)")
@@ -487,10 +490,12 @@ def cmd_supersede(args):
     db = connect(args.db)
     db.execute("UPDATE memory_item SET superseded_by=? WHERE id=?",
                (args.new, args.old))
-    tombstone(db, args.old, f"superseded by {args.new}")
+    at = now_iso()
+    tombstone(db, args.old, f"superseded by {args.new}", at=at)
     db.commit()
     db.close()
-    log_md(args.db, {"op": "supersede", "old": args.old, "new": args.new},
+    log_md(args.db, {"op": "supersede", "old": args.old, "new": args.new,
+                     "at": at},
            f"supersede {args.old} -> {args.new}")
     print(f"{args.old} superseded by {args.new} (old row kept, filtered from search)")
 
@@ -567,6 +572,7 @@ def cmd_dedup(args):
     rows = live_rows(db)
     merges = []
     seen = set()
+    dedup_at = now_iso()
     for a, b, cos, txt in dedup_candidates(rows):
         if a["id"] in seen or b["id"] in seen:
             continue
@@ -582,12 +588,13 @@ def cmd_dedup(args):
         if args.apply:
             db.execute("UPDATE memory_item SET superseded_by=? WHERE id=?",
                        (keep, drop))
-            tombstone(db, drop, f"dedup merged into {keep}")
+            tombstone(db, drop, f"dedup merged into {keep}", at=dedup_at)
     if args.apply:
         db.commit()
         for keep, drop, _, _ in merges:
             log_md(args.db, {"op": "supersede", "old": drop, "new": keep,
-                             "reason": "dedup"}, f"dedup {drop} -> {keep}")
+                             "reason": "dedup", "at": dedup_at},
+                   f"dedup {drop} -> {keep}")
         print(f"applied {len(merges)} merge(s); dropped rows kept as rejected")
     else:
         print("dry run — pass --apply to merge")
@@ -595,10 +602,23 @@ def cmd_dedup(args):
     return 0
 
 
-def restore(db, eid):
+def restore(db, eid, at=None):
     """Undo a quarantine and every cascade it caused. Returns rows restored."""
-    db.execute("UPDATE memory_item SET status='confirmed', updated=? WHERE id=?",
-               (now_iso(), eid))
+    # A restore is a human judgment that the entry is worth keeping, so it
+    # restarts the decay clock (restored_at). learned_at keeps the true age.
+    at = at or now_iso()
+    row = db.execute("SELECT metadata FROM memory_item WHERE id=?",
+                     (eid,)).fetchone()
+    try:
+        md = json.loads(row["metadata"]) if row and row["metadata"] else {}
+    except json.JSONDecodeError:
+        md = {}
+    if not isinstance(md, dict):
+        md = {}
+    md["restored_at"] = at
+    md.pop("tombstoned_at", None)
+    db.execute("UPDATE memory_item SET status='confirmed', updated=?, metadata=?"
+               " WHERE id=?", (at, json.dumps(md), eid))
     n = 1
     kids = db.execute(
         "SELECT subject_id FROM memory_edge WHERE object_id=? "
@@ -608,7 +628,7 @@ def restore(db, eid):
                        (k["subject_id"],)).fetchone()
         if r and r["status"] == "rejected" and \
                 f"cascade from {eid}" in (r["metadata"] or ""):
-            n += restore(db, k["subject_id"])
+            n += restore(db, k["subject_id"], at)
     return n
 
 
@@ -630,6 +650,13 @@ def gc_score(row, feedback):
     # bounded R term; letting a search reset decay would make retrieval
     # itself the survival signal (echo reinforcement, failure mode 2).
     age = days_since("learned_at")
+    try:
+        ra = (json.loads(row["metadata"] or "{}") or {}).get("restored_at")
+        if ra:
+            age = min(age, max(0.0, (nowdt - datetime.datetime.fromisoformat(
+                ra)).total_seconds() / 86400))
+    except (ValueError, TypeError, AttributeError):
+        pass
     since_access = days_since("last_accessed_at")
     half = LOW_SALIENCE_HALF_LIFE if row["salience"] <= 3 else \
         HALF_LIFE.get(row["type"], 30)
@@ -641,9 +668,10 @@ def gc_score(row, feedback):
 def cmd_gc(args):
     db = connect(args.db)
     if args.restore:
-        restored = restore(db, args.restore)
+        at = now_iso()
+        restored = restore(db, args.restore, at)
         db.commit()
-        log_md(args.db, {"op": "restore", "id": args.restore},
+        log_md(args.db, {"op": "restore", "id": args.restore, "at": at},
                f"restore {args.restore}")
         print(f"restored {args.restore} (+{restored - 1} cascaded child(ren))")
         db.close()
@@ -671,6 +699,7 @@ def cmd_gc(args):
             neg = f["c"]
         feedback[f["memory_id"]] = (pos, neg)
     quarantined = []
+    gc_at = now_iso()
     for row in live_rows(db):
         md = json.loads(row["metadata"]) if row["metadata"] else {}
         if is_exempt(row, md):
@@ -679,11 +708,12 @@ def cmd_gc(args):
         if score < GC_NOISE_FLOOR:
             quarantined.append((row["id"], score))
             if args.apply:
-                tombstone(db, row["id"], f"gc score {score:.4f} below floor")
+                tombstone(db, row["id"], f"gc score {score:.4f} below floor",
+                          at=gc_at)
     if args.apply:
         db.commit()
         for eid, score in quarantined:
-            log_md(args.db, {"op": "quarantine", "id": eid,
+            log_md(args.db, {"op": "quarantine", "id": eid, "at": gc_at,
                              "reason": f"gc score {score:.4f} below floor"},
                    f"quarantine {eid}")
         print(f"quarantined {len(quarantined)} entr(ies) (reversible)")
@@ -891,17 +921,19 @@ def cmd_reindex(args):
                 db = connect(args.db)
                 db.execute("UPDATE memory_item SET superseded_by=? WHERE id=?",
                            (rec["new"], rec["old"]))
-                tombstone(db, rec["old"], f"superseded by {rec['new']}")
+                tombstone(db, rec["old"], f"superseded by {rec['new']}",
+                          at=rec.get("at"))
                 db.commit()
                 db.close()
             elif op == "quarantine":
                 db = connect(args.db)
-                tombstone(db, rec["id"], rec.get("reason", "quarantine"))
+                tombstone(db, rec["id"], rec.get("reason", "quarantine"),
+                          at=rec.get("at"))
                 db.commit()
                 db.close()
             elif op == "restore":
                 db = connect(args.db)
-                restore(db, rec["id"])
+                restore(db, rec["id"], rec.get("at"))
                 db.commit()
                 db.close()
             elif op == "feedback":

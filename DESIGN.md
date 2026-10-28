@@ -135,7 +135,8 @@ entries sit 30 days; `--eviction-report` lists expired candidates for
 manual review. `--restore` pulls one back. Cascade pruning follows
 `derived_from` edges recursively, but never quarantines an exempt
 child; it flags `orphaned_parent` instead. `--restore` undoes the
-cascade it caused. High-salience rules (salience >= 9)
+cascade it caused and restarts the decay clock (`restored_at`), so the
+next GC doesn't undo the restore; `learned_at` keeps the true age. High-salience rules (salience >= 9)
 and `metadata.protected` entries are exempt. Default is dry-run;
 `--apply` executes.
 
@@ -155,8 +156,8 @@ mean the index is stale, not that the claim is wrong.
 Capture and every state change also append to a dated markdown log
 with one machine-readable record per line. `reindex` replays that log
 in timestamp order through the same code paths, so statuses,
-supersessions, feedback, promotions and learned_at (and therefore
-decay) come back exactly:
+supersessions, feedback, promotions, learned_at, restore times and
+quarantine times (so decay and eviction aging) come back exactly:
 
 ```bash
 rm memory.db

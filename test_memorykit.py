@@ -127,6 +127,18 @@ def run_mode(mode):
     check("gc: restore brings back cascaded child",
           st[p["id"]] == "confirmed" and st[lo["id"]] == "confirmed")
 
+    # 3b. Restore restarts the decay clock: the next GC must not re-flag it.
+    k.fresh()
+    r1, _, _ = k.cap("agent", "an old remark the user later wants kept", "--salience", "2")
+    k.sql("UPDATE memory_item SET learned_at='2026-01-01T00:00:00+00:00', "
+          "last_accessed_at='2026-01-01T00:00:00+00:00' WHERE id=?", (r1["id"],))
+    k.run("gc", "--apply")
+    k.run("gc", "--restore", r1["id"])
+    _, out, _ = k.run("gc")
+    la = k.sql("SELECT learned_at FROM memory_item WHERE id=?", (r1["id"],))[0][0]
+    check("gc: restored entry not re-flagged by next GC", r1["id"] not in out)
+    check("gc: restore keeps true learned_at", la.startswith("2026-01-01"))
+
     # 4. Retrieval does not reset decay.
     k.fresh()
     old, _, _ = k.cap("agent", "an old low salience remark about the garden hose",
@@ -201,7 +213,13 @@ def run_mode(mode):
     nt, _, _ = k.cap("agent", "I believe theme F sells best on weekends.")
     ev, _, _ = k.cap("user", "Confirmed by sales: theme F sells best on weekends.")
     k.run("promote", "--id", nt["id"], "--evidence", ev["id"])
+    k.run("gc", "--restore", q["id"])
+    q2, _, _ = k.cap("agent", "second throwaway remark about weather", "--salience", "1")
+    k.sql("UPDATE memory_item SET learned_at='2026-01-01T00:00:00+00:00' WHERE id=?", (q2["id"],))
+    k.run("gc", "--apply")
     before = snapshot(k)
+    upd_before = k.sql("SELECT id, updated FROM memory_item WHERE status='rejected'")
+    rest_before = k.sql("SELECT id, json_extract(metadata,'$.restored_at') FROM memory_item")
     fb_before = k.sql("SELECT memory_id, rating FROM memory_feedback")
     _, s_before, _ = k.run("search", "--query", "Robin shelf price", "--limit", "3")
     os.remove(k.db)
@@ -217,9 +235,14 @@ def run_mode(mode):
     # q's learned_at was hand-edited in SQL (outside the log) to force a GC
     # hit, so it is the one row the markdown cannot know about.
     check("reindex: learned_at preserved (decay survives rebuild)",
-          [x[6] for x in before if x[0] != q["id"]]
-          == [y[6] for y in after if y[0] != q["id"]])
+          [x[6] for x in before if x[0] not in (q["id"], q2["id"])]
+          == [y[6] for y in after if y[0] not in (q["id"], q2["id"])])
     check("reindex: feedback preserved", sorted(fb_before) == sorted(fb_after))
+    upd_after = k.sql("SELECT id, updated FROM memory_item WHERE status='rejected'")
+    rest_after = k.sql("SELECT id, json_extract(metadata,'$.restored_at') FROM memory_item")
+    check("reindex: quarantine time preserved (eviction aging survives)",
+          sorted(upd_before) == sorted(upd_after), f"{len(upd_before)} quarantined")
+    check("reindex: restore time preserved", sorted(rest_before) == sorted(rest_after))
     check("reindex: search results match", strip(s_before) == strip(s_after),
           f"{strip(s_before)[:1]}")
 
