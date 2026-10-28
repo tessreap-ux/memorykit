@@ -922,7 +922,9 @@ def cmd_promote(args):
 # distilled_from edge) and only wipes. If the wipe happened but its log line
 # did not, a reindex brings the turn back and the next run wipes it again.
 
-_HEADER = re.compile(r"^\s*\[turn provenance=[^\]]*\]\s*$")
+# Tolerant on purpose: case, and whitespace anywhere inside the brackets.
+_HEADER = re.compile(r"^\s*\[\s*turn\s+provenance\s*[=:]\s*[^\]]*\]\s*$",
+                     re.IGNORECASE)
 
 
 def _body(content):
