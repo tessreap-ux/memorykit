@@ -75,6 +75,12 @@ importance. A genuinely novel turn (best cosine < 0.50) gets +1.
 The gate never fails a capture; on any error the heuristic salience
 stands.
 
+### Promotion needs independent evidence
+`promote` turns a note into a fact only when pointed at a different,
+live, `user-said` or `tool-observed` entry that is not derived from the
+note (checked transitively). The link is stored as a `supported_by`
+edge. Speaker `agent` cannot self-stamp user or tool provenance.
+
 ### Contradiction check, never auto-resolve
 For important turns, run a similarity search first and review the
 candidates. The agent decides and supersedes explicitly. The system
@@ -93,6 +99,9 @@ Near-duplicates merge only when ALL gates pass:
 - same entry type,
 - embedding cosine >= 0.97,
 - raw-text similarity >= 0.90.
+
+Candidates are blocked by a vectorized cosine pass first; difflib only
+runs on pairs that clear the cosine gate.
 
 Plus a semantic guard: if two entries differ ONLY in identifier-like
 tokens (timestamps, message ids, counts), they are distinct historical
@@ -115,7 +124,8 @@ live entry:
   feedback (+1 ratings x1.5 each capped at x3, -1 ratings x0.5 floored
   at x0.25). Honest limit: this approximates "did retrieval help" —
   no causal instrument exists here, and none is pretended.
-- **Decay:** lambda = ln(2) / half-life. Half-lives: low-salience
+- **Decay:** lambda = ln(2) / half-life, measured from `learned_at`.
+  Retrieval never resets decay; access only feeds R (capped at 1.5x). Half-lives: low-salience
   turns 7d, notes 30d, facts 180d, rules 365d.
 - **R (reinforcement):** 1 + 0.5 x e^(-days_since_access / 30).
 
@@ -123,7 +133,9 @@ S below the noise floor (0.05) → **quarantined** (status `rejected`,
 reversible soft-delete, never hard-deleted by the GC). Quarantined
 entries sit 30 days; `--eviction-report` lists expired candidates for
 manual review. `--restore` pulls one back. Cascade pruning follows
-`derived_from` edges recursively. High-salience rules (salience >= 9)
+`derived_from` edges recursively, but never quarantines an exempt
+child; it flags `orphaned_parent` instead. `--restore` undoes the
+cascade it caused. High-salience rules (salience >= 9)
 and `metadata.protected` entries are exempt. Default is dry-run;
 `--apply` executes.
 
@@ -140,11 +152,25 @@ mean the index is stale, not that the claim is wrong.
 
 ## Rebuilding
 
+Capture and every state change also append to a dated markdown log
+with one machine-readable record per line. `reindex` replays that log
+in timestamp order through the same code paths, so statuses,
+supersessions, feedback, promotions and learned_at (and therefore
+decay) come back exactly:
+
 ```bash
 rm memory.db
-python3 memorykit.py init
-# re-capture from markdown (or re-index the corpus however you like)
+python3 memorykit.py reindex
 ```
+
+## Mode differences (stated, not hidden)
+
+- Keyword mode (no embedder): search is token overlap; novelty gate
+  relies on text similarity only; dedup merges only exact normalized
+  text; correlate uses a 0.3 overlap cutoff.
+- Vector mode: cosine scales differ (bge-small scores unrelated English
+  around 0.45), so correlate uses 0.75. This cutoff was calibrated on a
+  small sample; tune it on your own corpus.
 
 The database is an index, not an archive. If it disagrees with the
 markdown, the markdown wins.

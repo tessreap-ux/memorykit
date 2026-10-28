@@ -67,24 +67,45 @@ python3 memorykit.py correlate --markdown MEMORY.md
 | `dedup` | Merge near-duplicates (three gates + identifier guard). Dry-run by default. |
 | `gc` | Score every live entry; quarantine below-floor ones. `--restore ID` undoes one; `--eviction-report` lists quarantine-expired candidates for manual review. |
 | `backfill` | Compute vectors for rows stored before an embedder was installed. |
-| `correlate` | Audit curated markdown claims against the index; orphans reported, never deleted. |
+| `correlate` | Audit curated markdown claims against the index; orphans reported, never deleted. Vector mode uses a cosine cutoff of 0.75 (`MEMORYKIT_CORRELATE_COS`), keyword mode 0.3 token overlap. |
+| `feedback` | `--id ID --rating +1\|-1 [--comment]`. Feeds the U term in GC. |
+| `promote` | `--id NOTE --evidence ID`. Turns a note into a fact only on a different, live, user-said or tool-observed entry that is not derived from the note. |
+| `reindex` | Delete-and-rebuild the database from the markdown log alone (`--force` to replace an existing DB). |
 
 Options: `--db PATH` (default `memory.db`, or the `MEMORYKIT_DB`
 environment variable), `--session`, `--turn`, `--supersession-key
 state:foo` (auto-retires prior versions with the same key),
 `--parent-ids` (writes `derived_from` edges for cascade pruning),
-`--check` (advisory contradiction search before capture).
+`--check` (advisory contradiction search before capture),
+`--protected` (exempt from GC and from cascade quarantine).
+`MEMORYKIT_NO_EMBED=1` forces keyword mode.
 
 ## Rebuilding
 
 The database is an index, not an archive. If it disagrees with the
 markdown, the markdown wins:
 
+Every capture and every state change (supersede, dedup merge, GC
+quarantine, restore, feedback, promote) is appended to
+`memory-log/YYYY-MM-DD.md` next to the database (override with
+`MEMORYKIT_MD_DIR`). Each line is readable prose plus one
+`<!-- mk:{...} -->` record. That log is enough to rebuild everything:
+
 ```bash
 rm memory.db
-python3 memorykit.py init
-# re-capture from your markdown corpus
+python3 memorykit.py reindex
 ```
+
+Edits made directly in SQLite bypass the log and will not survive a
+rebuild. Change state through the commands.
+
+## Tests
+
+```bash
+python3 test_memorykit.py   # runs every check with the embedder, then in keyword mode
+```
+
+Vector mode reports SKIP, not PASS, when fastembed isn't installed.
 
 ## Safety rules (binding)
 
@@ -105,6 +126,7 @@ memorykit.py            the engine (one file)
 schema.sql              the index schema
 DESIGN.md               the design: layers, failure modes, defenses
 README.md               this file
+test_memorykit.py       acceptance tests, both modes
 config.example.json     tunable thresholds (copy to config.json if you wire one in)
 templates/
   MEMORY.md             curated memory template

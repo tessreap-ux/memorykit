@@ -35,6 +35,12 @@ Usage:
   python3 memorykit.py gc --eviction-report
   python3 memorykit.py backfill
   python3 memorykit.py correlate --markdown MEMORY.md
+  python3 memorykit.py feedback --id ID --rating +1|-1 [--comment "..."]
+  python3 memorykit.py promote --id NOTE_ID --evidence EVIDENCE_ID
+  python3 memorykit.py reindex [--md-dir DIR] [--force]
+
+Every capture and state change is also appended to ./memory-log/YYYY-MM-DD.md
+(override with MEMORYKIT_MD_DIR), which is what `reindex` rebuilds from.
 """
 import argparse
 import datetime
@@ -66,8 +72,14 @@ SPEAKER_PROVENANCE = {
     "agent": "agent-said",
 }
 
+# Decision markers are phrases, not single common verbs: a bare "will"
+# matched nearly every sentence and handed out +2 to everything.
 DECISION_RE = re.compile(
-    r"\b(decid|prefer|always|never|will\b|won't|must|rule|boundary|promis|commit|decree|standing)\b",
+    r"\b(decided|decision|we agreed|agreed to|i prefer|prefers?\b|preference"
+    r"|always|never|must\b|must not|rule\b|rule:|boundary|promised?|promise to"
+    r"|commit(?:ted|ment)?\b|from now on|going forward|standing (?:rule|order)"
+    r"|won't ever|will never|do not ever|deadline|by (?:monday|tuesday|wednesday"
+    r"|thursday|friday|saturday|sunday))",
     re.I)
 CORRECTION_RE = re.compile(
     r"\b(wrong|actually\b|correction|mistaken|misquot|not a|isn't|aren't)\b", re.I)
@@ -105,6 +117,40 @@ def now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+# ---------------------------------------------------------------- markdown log
+#
+# Every capture and every state change (supersede, quarantine, restore,
+# feedback, promote) is appended to a dated markdown log. Each line is human
+# readable and carries one machine-readable HTML comment, so `reindex` can
+# rebuild the whole database from markdown alone. The database is therefore
+# genuinely disposable.
+
+_REPLAYING = False
+MK_RE = re.compile(r"<!-- mk:(\{.*\}) -->\s*$")
+
+
+def md_dir_for(db_path):
+    return os.environ.get("MEMORYKIT_MD_DIR") or os.path.join(
+        os.path.dirname(os.path.abspath(db_path)), "memory-log")
+
+
+def log_md(db_path, record, display):
+    """Append one record to today's markdown log (no-op during reindex)."""
+    if _REPLAYING:
+        return
+    d = md_dir_for(db_path)
+    os.makedirs(d, exist_ok=True)
+    record.setdefault("at", now_iso())
+    day = record["at"][:10]
+    path = os.path.join(d, f"{day}.md")
+    new = not os.path.exists(path)
+    one_line = " ".join(display.split())[:300]
+    with open(path, "a", encoding="utf-8") as fh:
+        if new:
+            fh.write(f"# memorykit log {day}\n\n")
+        fh.write(f"- {one_line} <!-- mk:{json.dumps(record, ensure_ascii=False)} -->\n")
+
+
 def connect(db_path):
     db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row
@@ -133,6 +179,9 @@ def get_embedder():
     if _embedder_tried:
         return _embedder
     _embedder_tried = True
+    if os.environ.get("MEMORYKIT_NO_EMBED") == "1":
+        _embedder = None  # forced keyword mode (tests, low-resource hosts)
+        return None
     try:
         from fastembed import TextEmbedding
         _embedder = TextEmbedding(model_name=MODEL)
@@ -316,8 +365,10 @@ def cmd_capture(args):
     if parent_ids:
         metadata["parent_ids"] = parent_ids
     content = f"[turn provenance={provenance}]\n{text}"
-    new_id = uuid.uuid4().hex[:24]
-    now = now_iso()
+    new_id = getattr(args, "force_id", None) or uuid.uuid4().hex[:24]
+    now = getattr(args, "force_at", None) or now_iso()
+    if args.protected:
+        metadata["protected"] = True
     db.execute(
         """INSERT INTO memory_item
            (id, created, updated, project, session_key, type, content,
@@ -327,10 +378,12 @@ def cmd_capture(args):
         (new_id, now, now, args.project, args.session or "", mtype, content,
          salience, confidence, json.dumps(metadata),
          json.dumps(vecs[0]) if vecs else None, now, now, now))
+    retired = []
     for old_id in metadata.get("supersedes", []):
         db.execute("UPDATE memory_item SET superseded_by=? WHERE id=?",
                    (new_id, old_id))
         tombstone(db, old_id, f"superseded by {new_id}")
+        retired.append(old_id)
     skey = metadata.get("supersession_key")
     if skey:
         prior = db.execute(
@@ -341,6 +394,7 @@ def cmd_capture(args):
             db.execute("UPDATE memory_item SET superseded_by=? WHERE id=?",
                        (new_id, p["id"]))
             tombstone(db, p["id"], f"supersession key {skey} -> {new_id}")
+            retired.append(p["id"])
         if prior:
             print(f"supersession-key {skey}: retired {len(prior)} prior version(s)")
     for parent in parent_ids:
@@ -352,6 +406,15 @@ def cmd_capture(args):
             (uuid.uuid4().hex[:24], now, now, args.project, new_id, parent, new_id))
     db.commit()
     db.close()
+    log_md(args.db, {
+        "op": "capture", "id": new_id, "at": now, "speaker": args.speaker,
+        "provenance": provenance, "text": text, "salience": salience,
+        "salience_manual": bool(args.salience), "project": args.project,
+        "session": args.session or "", "turn": args.turn,
+        "supersedes": sorted(set(retired)), "supersession_key": skey or "",
+        "parents": parent_ids, "protected": bool(args.protected),
+        "novelty": novelty},
+        f"[{provenance}] {text}")
     print(f"saved id={new_id} provenance={provenance} "
           f"salience={salience} confidence={confidence}")
     if vecs is None:
@@ -427,6 +490,8 @@ def cmd_supersede(args):
     tombstone(db, args.old, f"superseded by {args.new}")
     db.commit()
     db.close()
+    log_md(args.db, {"op": "supersede", "old": args.old, "new": args.new},
+           f"supersede {args.old} -> {args.new}")
     print(f"{args.old} superseded by {args.new} (old row kept, filtered from search)")
 
 
@@ -442,30 +507,75 @@ def provenance_rank(row):
     return (0 if row["type"] == "fact" else 1, -row["confidence"])
 
 
+def _norm_text(c):
+    c = re.sub(r"^\[turn provenance=[^\]]*\]\n", "", c or "")
+    return " ".join(c.lower().split())
+
+
+def dedup_candidates(rows):
+    """Pairs (a, b, cos, txt) that pass every merge gate.
+
+    Blocking: cosine is computed first (vectorized with numpy when present,
+    in row chunks), and difflib only runs on pairs that clear the cosine
+    gate. Rows without vectors (keyword mode) merge only on an exact match
+    of normalized text, since there is no meaning signal to gate on.
+    """
+    out = []
+    with_vec = [(r, load_vec(r)) for r in rows]
+    vec_rows = [(r, v) for r, v in with_vec if v]
+    no_vec = [r for r, v in with_vec if not v]
+    pairs = []
+    if vec_rows:
+        try:
+            import numpy as np
+            M = np.array([v for _, v in vec_rows], dtype=np.float32)
+            M /= np.maximum(np.linalg.norm(M, axis=1, keepdims=True), 1e-12)
+            step = 512
+            for i0 in range(0, len(M), step):
+                sims = M[i0:i0 + step] @ M.T
+                ii, jj = np.nonzero(sims >= DEDUP_COSINE)
+                for i, j in zip(ii.tolist(), jj.tolist()):
+                    gi = i0 + i
+                    if j > gi:
+                        pairs.append((gi, j, float(sims[i, j])))
+        except ImportError:
+            for gi in range(len(vec_rows)):
+                for j in range(gi + 1, len(vec_rows)):
+                    c = cosine(vec_rows[gi][1], vec_rows[j][1])
+                    if c >= DEDUP_COSINE:
+                        pairs.append((gi, j, c))
+    for gi, j, c in pairs:
+        a, b = vec_rows[gi][0], vec_rows[j][0]
+        if a["type"] != b["type"]:
+            continue
+        txt = difflib.SequenceMatcher(None, (a["content"] or "")[:4000],
+                                      (b["content"] or "")[:4000]).ratio()
+        if txt >= DEDUP_TEXT and not identifier_only_diff(
+                a["content"] or "", b["content"] or ""):
+            out.append((a, b, c, txt))
+    buckets = {}
+    for r in no_vec:
+        buckets.setdefault((r["type"], _norm_text(r["content"])), []).append(r)
+    for group in buckets.values():
+        for b in group[1:]:
+            out.append((group[0], b, 0.0, 1.0))
+    return out
+
+
 def cmd_dedup(args):
     db = connect(args.db)
     rows = live_rows(db)
     merges = []
     seen = set()
-    for i, a in enumerate(rows):
-        if a["id"] in seen:
+    for a, b, cos, txt in dedup_candidates(rows):
+        if a["id"] in seen or b["id"] in seen:
             continue
-        for b in rows[i + 1:]:
-            if b["id"] in seen or a["type"] != b["type"]:
-                continue
-            av, bv = load_vec(a), load_vec(b)
-            cos = cosine(av, bv) if (av and bv) else 0.0
-            txt = difflib.SequenceMatcher(
-                None, (a["content"] or "")[:4000],
-                (b["content"] or "")[:4000]).ratio()
-            if cos >= DEDUP_COSINE and txt >= DEDUP_TEXT:
-                if identifier_only_diff(a["content"] or "", b["content"] or ""):
-                    continue  # distinct historical events — never merge
-                keep, drop = sorted([a, b], key=provenance_rank)
-                merges.append((keep["id"], drop["id"], cos, txt))
-                seen.add(drop["id"])
+        keep, drop = sorted([a, b], key=provenance_rank)
+        merges.append((keep["id"], drop["id"], cos, txt))
+        seen.add(drop["id"])
     if not merges:
         print("no merge candidates")
+        db.close()
         return 0
     for keep, drop, cos, txt in merges:
         print(f"merge: keep {keep} drop {drop} (cos={cos:.3f} txt={txt:.3f})")
@@ -475,6 +585,9 @@ def cmd_dedup(args):
             tombstone(db, drop, f"dedup merged into {keep}")
     if args.apply:
         db.commit()
+        for keep, drop, _, _ in merges:
+            log_md(args.db, {"op": "supersede", "old": drop, "new": keep,
+                             "reason": "dedup"}, f"dedup {drop} -> {keep}")
         print(f"applied {len(merges)} merge(s); dropped rows kept as rejected")
     else:
         print("dry run — pass --apply to merge")
@@ -530,6 +643,8 @@ def cmd_gc(args):
     if args.restore:
         restored = restore(db, args.restore)
         db.commit()
+        log_md(args.db, {"op": "restore", "id": args.restore},
+               f"restore {args.restore}")
         print(f"restored {args.restore} (+{restored - 1} cascaded child(ren))")
         db.close()
         return 0
@@ -567,6 +682,10 @@ def cmd_gc(args):
                 tombstone(db, row["id"], f"gc score {score:.4f} below floor")
     if args.apply:
         db.commit()
+        for eid, score in quarantined:
+            log_md(args.db, {"op": "quarantine", "id": eid,
+                             "reason": f"gc score {score:.4f} below floor"},
+                   f"quarantine {eid}")
         print(f"quarantined {len(quarantined)} entr(ies) (reversible)")
     else:
         print(f"dry run: {len(quarantined)} entr(ies) would quarantine")
@@ -627,6 +746,179 @@ def cmd_correlate(args):
     return 0
 
 
+def cmd_feedback(args):
+    db = connect(args.db)
+    if not db.execute("SELECT 1 FROM memory_item WHERE id=?",
+                      (args.id,)).fetchone():
+        print(f"no entry {args.id}", file=sys.stderr)
+        return 1
+    at = getattr(args, "force_at", None) or now_iso()
+    db.execute("INSERT INTO memory_feedback (id, created, memory_id, rating, comment)"
+               " VALUES (?, ?, ?, ?, ?)",
+               (uuid.uuid4().hex[:24], at, args.id, args.rating, args.comment))
+    db.commit()
+    db.close()
+    log_md(args.db, {"op": "feedback", "id": args.id, "rating": args.rating,
+                     "comment": args.comment or "", "at": at},
+           f"feedback {args.rating} on {args.id}")
+    print(f"recorded {args.rating} on {args.id}")
+    return 0
+
+
+def cmd_promote(args):
+    """Promote a note to fact ONLY on independent evidence.
+
+    The evidence must be a different, live entry with user-said or
+    tool-observed provenance, and it must not be derived from the note
+    (directly or transitively). Repetition never promotes."""
+    db = connect(args.db)
+    note = db.execute("SELECT * FROM memory_item WHERE id=?", (args.id,)).fetchone()
+    ev = db.execute("SELECT * FROM memory_item WHERE id=?",
+                    (args.evidence,)).fetchone()
+
+    def fail(msg):
+        print(f"REFUSED: {msg}", file=sys.stderr)
+        db.close()
+        return 2
+    if not note or not ev:
+        return fail("note or evidence not found")
+    if note["id"] == ev["id"]:
+        return fail("an entry cannot be its own evidence")
+    if note["type"] != "note":
+        return fail(f"entry is already type={note['type']}")
+    if ev["status"] == "rejected" or ev["superseded_by"]:
+        return fail("evidence is not live")
+    ev_md = json.loads(ev["metadata"] or "{}")
+    if ev_md.get("provenance") not in ("user-said", "tool-observed"):
+        return fail("evidence must be user-said or tool-observed")
+    frontier, seen = [ev["id"]], set()
+    while frontier:
+        cur = frontier.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        for e in db.execute("SELECT object_id FROM memory_edge WHERE subject_id=?"
+                            " AND predicate='derived_from'", (cur,)).fetchall():
+            if e["object_id"] == note["id"]:
+                return fail("evidence is derived from the note itself")
+            frontier.append(e["object_id"])
+    md = json.loads(note["metadata"] or "{}")
+    md["promoted_by"] = ev["id"]
+    md["promoted_at"] = getattr(args, "force_at", None) or now_iso()
+    db.execute("UPDATE memory_item SET type='fact', confidence=?, metadata=?, "
+               "updated=? WHERE id=?",
+               (max(note["confidence"], ev["confidence"]), json.dumps(md),
+                now_iso(), note["id"]))
+    db.execute("INSERT INTO memory_edge (id, project, subject_id, predicate, "
+               "object_id, source_id) VALUES (?, ?, ?, 'supported_by', ?, ?)",
+               (uuid.uuid4().hex[:24], note["project"], note["id"], ev["id"],
+                ev["id"]))
+    db.commit()
+    db.close()
+    log_md(args.db, {"op": "promote", "id": args.id, "evidence": args.evidence,
+                     "at": md["promoted_at"]},
+           f"promote {args.id} on evidence {args.evidence}")
+    print(f"promoted {args.id} to fact on evidence {args.evidence}")
+    return 0
+
+
+def cmd_reindex(args):
+    """Rebuild the database from the markdown log alone.
+
+    Replays every mk record in timestamp order through the same code paths
+    that wrote it, with logging off. Vectors are recomputed if an embedder
+    is installed (otherwise run `backfill` later)."""
+    global _REPLAYING
+    d = args.md_dir or md_dir_for(args.db)
+    files = sorted(f for f in os.listdir(d) if f.endswith(".md")) \
+        if os.path.isdir(d) else []
+    records = []
+    for f in files:
+        for n, line in enumerate(open(os.path.join(d, f), encoding="utf-8")):
+            m = MK_RE.search(line)
+            if m:
+                try:
+                    records.append((json.loads(m.group(1)), f, n))
+                except json.JSONDecodeError:
+                    print(f"skip malformed record {f}:{n + 1}", file=sys.stderr)
+    records.sort(key=lambda x: (x[0].get("at", ""), x[1], x[2]))
+    if os.path.exists(args.db):
+        if not args.force:
+            print(f"{args.db} exists; pass --force to replace it", file=sys.stderr)
+            return 1
+        os.remove(args.db)
+    init_db(args.db)
+    _REPLAYING = True
+    counts = {}
+    try:
+        for rec, _, _ in records:
+            op = rec.get("op")
+            counts[op] = counts.get(op, 0) + 1
+            if op == "capture":
+                ns = argparse.Namespace(
+                    db=args.db, speaker=rec["speaker"], text=rec["text"],
+                    session=rec.get("session", ""), turn=rec.get("turn", ""),
+                    provenance=rec["provenance"],
+                    salience=rec["salience"], supersedes=",".join(
+                        rec.get("supersedes", [])),
+                    supersession_key="", parent_ids=",".join(
+                        rec.get("parents", [])), check=False,
+                    project=rec.get("project", "turns"),
+                    protected=rec.get("protected", False),
+                    force_id=rec["id"], force_at=rec["at"])
+                with open(os.devnull, "w") as devnull:
+                    old = sys.stdout
+                    sys.stdout = devnull
+                    try:
+                        cmd_capture(ns)
+                    finally:
+                        sys.stdout = old
+                db = connect(args.db)
+                md = json.loads(db.execute(
+                    "SELECT metadata FROM memory_item WHERE id=?",
+                    (rec["id"],)).fetchone()[0])
+                if rec.get("supersession_key"):
+                    md["supersession_key"] = rec["supersession_key"]
+                md["salience_reason"] = "manual" if rec.get(
+                    "salience_manual") else "heuristic"
+                md["novelty"] = rec.get("novelty", md.get("novelty"))
+                md["reindexed"] = True
+                db.execute("UPDATE memory_item SET metadata=?, last_accessed_at=?"
+                           " WHERE id=?", (json.dumps(md), rec["at"], rec["id"]))
+                db.commit()
+                db.close()
+            elif op == "supersede":
+                db = connect(args.db)
+                db.execute("UPDATE memory_item SET superseded_by=? WHERE id=?",
+                           (rec["new"], rec["old"]))
+                tombstone(db, rec["old"], f"superseded by {rec['new']}")
+                db.commit()
+                db.close()
+            elif op == "quarantine":
+                db = connect(args.db)
+                tombstone(db, rec["id"], rec.get("reason", "quarantine"))
+                db.commit()
+                db.close()
+            elif op == "restore":
+                db = connect(args.db)
+                restore(db, rec["id"])
+                db.commit()
+                db.close()
+            elif op == "feedback":
+                cmd_feedback(argparse.Namespace(
+                    db=args.db, id=rec["id"], rating=rec["rating"],
+                    comment=rec.get("comment") or None, force_at=rec["at"]))
+            elif op == "promote":
+                cmd_promote(argparse.Namespace(
+                    db=args.db, id=rec["id"], evidence=rec["evidence"],
+                    force_at=rec["at"]))
+    finally:
+        _REPLAYING = False
+    print(f"reindexed {len(records)} record(s) from {len(files)} file(s): "
+          + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=DEFAULT_DB)
@@ -647,6 +939,8 @@ def main():
     p.add_argument("--parent-ids", default="")
     p.add_argument("--check", action="store_true")
     p.add_argument("--project", default="turns")
+    p.add_argument("--protected", action="store_true",
+                   help="exempt from GC and from cascade quarantine")
     p.set_defaults(fn=cmd_capture)
 
     p = sub.add_parser("search")
@@ -673,6 +967,23 @@ def main():
     p.add_argument("--eviction-report", action="store_true")
     p.set_defaults(fn=cmd_gc)
 
+    p = sub.add_parser("feedback")
+    p.add_argument("--id", required=True)
+    p.add_argument("--rating", required=True, choices=["+1", "-1"])
+    p.add_argument("--comment", default=None)
+    p.set_defaults(fn=cmd_feedback)
+
+    p = sub.add_parser("promote")
+    p.add_argument("--id", required=True, help="the note to promote")
+    p.add_argument("--evidence", required=True,
+                   help="a live user-said or tool-observed entry")
+    p.set_defaults(fn=cmd_promote)
+
+    p = sub.add_parser("reindex")
+    p.add_argument("--md-dir", default="")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_reindex)
+
     p = sub.add_parser("backfill")
     p.set_defaults(fn=cmd_backfill)
 
@@ -681,7 +992,7 @@ def main():
     p.set_defaults(fn=cmd_correlate)
 
     args = ap.parse_args()
-    if args.cmd != "init" and not os.path.exists(args.db):
+    if args.cmd not in ("init", "reindex") and not os.path.exists(args.db):
         print(f"no database at {args.db} — run `init` first", file=sys.stderr)
         return 1
     return args.fn(args)
