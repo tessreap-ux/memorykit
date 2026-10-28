@@ -125,6 +125,12 @@ AUTO = os.environ.get("MEMORYKIT_AUTO", "1") == "1"
 SETTLE_TURNS = int(os.environ.get("MEMORYKIT_SETTLE_TURNS", "8"))
 SWEEP_EVERY = int(os.environ.get("MEMORYKIT_SWEEP_EVERY", "50"))
 AUTO_DISTILLER = os.environ.get("MEMORYKIT_DISTILLER", "")
+# Output is paid for in tokens by whoever reads it. Defaults are terse.
+VERBOSE = os.environ.get("MEMORYKIT_VERBOSE", "0") == "1"
+SNIPPET_CHARS = int(os.environ.get("MEMORYKIT_SNIPPET_CHARS", "200"))
+# A raw turn retrieved this many times before it settles is distilled even
+# when its phrasing scored under the salience floor: use is evidence.
+SLEEP_MIN_HITS = int(os.environ.get("MEMORYKIT_SLEEP_MIN_HITS", "2"))
 # Half-lives in days, by entry type (low-salience turns decay fastest).
 HALF_LIFE = {"fact": 180, "note": 30, "rule": 365}
 LOW_SALIENCE_HALF_LIFE = 7
@@ -277,6 +283,20 @@ def salience_heuristic(text):
     return max(1, min(10, s))
 
 
+_NEGWORDS = {"not", "never", "no", "isn", "aren", "wasn", "don", "doesn",
+             "didn", "won", "can", "cannot", "without", "t"}
+
+
+def value_change(a, b):
+    """True when two texts differ ONLY in numbers or negation words: the
+    same statement with a changed value ("costs 40" vs "costs 55"). That is
+    an update or a contradiction, never a restatement."""
+    ta = set(re.findall(r"\w+", (a or "").lower()))
+    tb = set(re.findall(r"\w+", (b or "").lower()))
+    diff = ta ^ tb
+    return bool(diff) and all(t.isdigit() or t in _NEGWORDS for t in diff)
+
+
 def novelty_adjust(db, text, salience):
     """Restatements can't inflate into importance; novelty gets +1.
 
@@ -300,6 +320,8 @@ def novelty_adjust(db, text, salience):
             body = re.sub(r"^\[turn provenance=[^\]]*\]\n", "",
                           r["content"] or "")
             t = difflib.SequenceMatcher(None, text[:2000], body[:2000]).ratio()
+            if value_change(text, body):
+                continue  # a changed value is news, not a restatement
             scored.append((max(c, 0.0), t))
         # Cosine and text similarity are judged independently across ALL
         # live rows. (Taking text similarity only from the top-8-by-cosine
@@ -368,12 +390,10 @@ def cmd_capture(args):
         return 0
     if args.check:
         hits = search_rows(db, text, 5)
-        print("=== possible related entries (review for contradiction) ===")
+        # Advisory only; nothing is auto-resolved. Terse: id, type, snippet.
         for r, score, sim in hits:
-            print(f"- id={r['id']} type={r['type']} conf={r['confidence']} "
-                  f"sal={r['salience']} score={score:.3f}")
-            print(f"  {(r['content'] or '')[:220]}".replace("\n", " "))
-        print("=== end (advisory only — nothing auto-resolved) ===")
+            print(f"related {short(r['id'])} {r['type']} "
+                  f"{snippet(r['content'], text, SNIPPET_CHARS // 2)}")
     provenance = args.provenance or SPEAKER_PROVENANCE[args.speaker]
     if args.speaker == "agent" and provenance not in ("agent-said",
                                                       "agent-inferred"):
@@ -466,59 +486,182 @@ def cmd_capture(args):
         "parents": parent_ids, "protected": bool(args.protected),
         "novelty": novelty},
         f"[{provenance}] {text}")
-    print(f"saved id={new_id} provenance={provenance} "
-          f"salience={salience} confidence={confidence}")
+    # Terse receipt: the id and the one number that decides its fate.
+    print(f"saved id={short(new_id)} salience={salience}"
+          + (f" provenance={provenance}" if VERBOSE else ""))
     if AUTO and not _REPLAYING and not getattr(args, "no_auto", False):
         auto_sleep(args.db)
-    if vecs is None:
-        print("note: no embedder installed — entry stored without a vector; "
-              "run `backfill` after installing one "
-              "(pip install fastembed)", file=sys.stderr)
+    if vecs is None and not os.environ.get("MEMORYKIT_NO_EMBED"):
+        db = connect(args.db)
+        if not state_get(db, "warned_no_embed", False):
+            print("note: no embedder installed; keyword mode. Run `backfill` "
+                  "after `pip install fastembed` (shown once)", file=sys.stderr)
+            state_set(db, "warned_no_embed", True)
+            db.commit()
+        db.close()
     return 0
 
 
+_TOK = re.compile(r"\w+")
+
+
+def _tokens(text):
+    return [t for t in _TOK.findall((text or "").lower()) if len(t) > 1]
+
+
+def _bm25(query_toks, docs, k1=1.2, b=0.75):
+    """Plain BM25 over the candidate set. Stdlib only."""
+    n = len(docs)
+    if not n:
+        return [], {}
+    avgdl = sum(len(d) for d in docs) / n or 1.0
+    df = {}
+    for d in docs:
+        for t in set(d):
+            df[t] = df.get(t, 0) + 1
+    idf = {t: math.log(1 + (n - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5))
+           for t in set(query_toks)}
+    out = []
+    for d in docs:
+        tf = {}
+        for t in d:
+            if t in idf:
+                tf[t] = tf.get(t, 0) + 1
+        sc = 0.0
+        for t, f in tf.items():
+            sc += idf[t] * f * (k1 + 1) / (f + k1 * (1 - b + b * len(d) / avgdl))
+        out.append(sc)
+    return out, idf
+
+
+def _minmax(xs):
+    lo, hi = min(xs), max(xs)
+    return [(x - lo) / (hi - lo) if hi > lo else 0.0 for x in xs]
+
+
 def search_rows(db, query, limit):
-    """Top matches, live rows only. Reranks by similarity x salience x recency."""
+    """Hybrid retrieval, live rows only.
+
+    relevance = (1-w) * minmax(cosine) + w * minmax(BM25), where w is how much
+    of the query's IDF mass the best lexical match covers, squared. Exact
+    wording leans lexical, paraphrase leans semantic. Keyword mode is BM25.
+    Salience and recency only TILT relevance (x0.8..1.0 and x0.9..1.0);
+    they never outrank it. On a 36-query benchmark the old product
+    (sim x salience) put the target in the top 5 about 10% of the time."""
     rows = live_rows(db)
+    if not rows:
+        return []
     vecs = embed_texts([query[:4000]])
     qvec = vecs[0] if vecs else None
-    qtok = set(t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) > 2)
+    qt = _tokens(query)
+    docs = [_tokens(_body(r["content"])) for r in rows]
+    lex, idf = _bm25(qt, docs)
+    best = max(range(len(rows)), key=lambda i: lex[i])
+    tot = sum(idf.values()) or 1.0
+    cover = sum(v for t, v in idf.items() if t in set(docs[best])) / tot
+    w = cover ** 2
+    sims = None
+    if qvec:
+        sims = [cosine(qvec, load_vec(r)) if load_vec(r) else 0.0 for r in rows]
+    if sims and any(sims):
+        sn, ln = _minmax(sims), _minmax(lex) if max(lex) > 0 else [0.0] * len(lex)
+        rel = [(1 - w) * a + w * b for a, b in zip(sn, ln)]
+    else:
+        # Keyword mode: rank by BM25; report query-token coverage as the
+        # absolute "sim" (callers like correlate threshold on it).
+        qs = set(t for t in qt if len(t) > 2)
+        sims = [len(qs & set(d)) / len(qs) if qs else 0.0 for d in docs]
+        rel = lex
     now = datetime.datetime.now(datetime.timezone.utc)
     scored = []
-    for r in rows:
-        rv = load_vec(r)
-        content = (r["content"] or "").lower()
-        if qvec and rv:
-            sim = cosine(qvec, rv)
-        else:
-            # No vectors (no embedder, or row not backfilled yet): fall back
-            # to query-token overlap instead of full-string substring, which
-            # is too strict to be useful ("photo folder name" should match
-            # "the photo folder is called Quiet").
-            ctok = set(re.findall(r"[a-z0-9]+", content))
-            sim = len(qtok & ctok) / len(qtok) if qtok else 0.0
+    for r, rv, lx, sm in zip(rows, rel, lex, sims):
+        if rv <= 0 or (lx <= 0 and sm <= 0):
+            continue
         try:
             accessed = datetime.datetime.fromisoformat(r["last_accessed_at"])
             age_days = max(0.0, (now - accessed).total_seconds() / 86400)
         except (ValueError, TypeError):
             age_days = 0.0
         recency = 1.0 / (1.0 + age_days / 30.0)
-        score = sim * (r["salience"] / 10.0) * (0.5 + 0.5 * recency)
-        if sim > 0:
-            scored.append((r, score, sim))
+        score = rv * (0.8 + 0.2 * r["salience"] / 10.0) * (0.9 + 0.1 * recency)
+        scored.append((r, score, sm))
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[:limit]
+
+
+def snippet(text, query, width, qvec=None):
+    """The `width`-char window of `text` that best answers `query`.
+
+    Windows are scored on query-word overlap (5-char stems, so "stored"
+    meets "store"); when no window shares a word (pure paraphrase) and an
+    embedder is present, windows are ranked by cosine instead. Costs CPU,
+    never tokens; saves the reader from paying for a whole entry."""
+    text = " ".join(_body(text).split())
+    if len(text) <= width:
+        return text
+    stem = lambda w: w[:5]
+    qs = {stem(t) for t in _tokens(query) if len(t) > 2}
+    words = text.split(" ")
+    pos, i = [], 0
+    for wd in words:
+        pos.append(i)
+        i += len(wd) + 1
+    hitw = [{stem(t) for t in _tokens(wd)} & qs for wd in words]
+    starts, scores = [], []
+    step = max(1, len(words) // 60)  # cap the number of candidate windows
+    # Candidate windows open just before a matched word, so ties resolve to
+    # a window that starts at the evidence instead of trailing into it.
+    cands = sorted({max(0, k - 2) for k, h in enumerate(hitw) if h}) or \
+        list(range(0, len(words), step))
+    for k in cands:
+        j, got = k, set()
+        while j < len(words) and pos[j] - pos[k] < width:
+            got |= hitw[j]  # distinct query words covered, not repeats
+            j += 1
+        starts.append(k)
+        scores.append(len(got))
+    best_k = starts[max(range(len(starts)), key=lambda x: scores[x])]
+    if max(scores) == 0 and qvec:
+        wins = [text[pos[k]:pos[k] + width] for k in starts]
+        vecs = embed_texts(wins)
+        if vecs:
+            best_k = starts[max(range(len(wins)), key=lambda x: cosine(qvec, vecs[x]))]
+    start = pos[best_k]
+    end = start + width
+    out = text[start:end].rsplit(" ", 1)[0] if end < len(text) else text[start:]
+    return ("…" if start else "") + out + ("…" if end < len(text) else "")
 
 
 def cmd_search(args):
     db = connect(args.db)
     hits = search_rows(db, args.query, args.limit)
+    qv = embed_texts([args.query[:4000]]) if hits else None
+    qv = qv[0] if qv else None
+    budget = getattr(args, "budget", 0) or 0  # approx tokens, 4 chars each
+    used, shown, seen = 0, 0, set()
     for r, score, sim in hits:
-        print(f"- id={r['id']} type={r['type']} sal={r['salience']} "
-              f"conf={r['confidence']} score={score:.3f}")
-        print(f"  {(r['content'] or '')[:400]}".replace("\n", " "))
+        snip = snippet(r["content"], args.query, args.chars, qv)
+        if snip in seen:
+            continue  # identical text already shown: pay for it once
+        seen.add(snip)
+        if args.verbose:
+            line = (f"- id={r['id']} type={r['type']} sal={r['salience']} "
+                    f"conf={r['confidence']} score={score:.3f}\n  {snip}")
+        else:
+            line = f"{short(r['id'])} {r['type']} {snip}"
+        cost = len(line) // 4 + 1
+        if budget and shown and used + cost > budget:
+            break
+        print(line)
+        used += cost
+        shown += 1
         db.execute("UPDATE memory_item SET last_accessed_at=? WHERE id=?",
                    (now_iso(), r["id"]))
+        if r["project"] != SEMANTIC_PROJECT:
+            md = json.loads(r["metadata"] or "{}")
+            md["hits"] = md.get("hits", 0) + 1
+            db.execute("UPDATE memory_item SET metadata=? WHERE id=?",
+                       (json.dumps(md), r["id"]))
     db.commit()
     db.close()
     if not hits:
@@ -532,7 +675,14 @@ def cmd_get(args):
     if not r:
         print(f"no entry {args.id}")
         return 1
-    print(json.dumps(dict(r), indent=2, default=str))
+    if getattr(args, "text", False):
+        print(_body(r["content"]))  # just the words: cheapest full read
+        return 0
+    d = dict(r)
+    if not getattr(args, "with_embedding", False):
+        d.pop("embedding", None)  # 384 floats is thousands of tokens of noise
+    print(json.dumps(d, default=str, ensure_ascii=False,
+                     indent=2 if getattr(args, "pretty", False) else None))
     return 0
 
 
@@ -967,6 +1117,29 @@ def _run_distiller(cmd, payload):
     return text
 
 
+CONFLICT_SIM = float(os.environ.get("MEMORYKIT_CONFLICT_SIM", "0.85"))
+
+
+def find_conflicts(db, text, vec):
+    """Live semantic entries that say nearly the same thing with a different
+    number or flipped negation. Flagged, never auto-resolved: deciding which
+    is true needs evidence, not similarity. Costs no tokens."""
+    out = []
+    for r in db.execute("SELECT id, content, embedding FROM memory_item WHERE "
+                        "project=? AND status != 'rejected' AND superseded_by "
+                        "IS NULL", (SEMANTIC_PROJECT,)).fetchall():
+        other = _body(r["content"])
+        if vec and r["embedding"]:
+            sim = cosine(vec, json.loads(r["embedding"]))
+        else:
+            sim = difflib.SequenceMatcher(None, text.lower(), other.lower()).ratio()
+        if sim < CONFLICT_SIM:
+            continue
+        if value_change(text, other):
+            out.append(r["id"])
+    return out
+
+
 def insert_semantic(db, db_path, eid, at, text, provenance, salience, turns,
                     supersession_key="", protected=False):
     if db.execute("SELECT 1 FROM memory_item WHERE id=?", (eid,)).fetchone():
@@ -979,6 +1152,9 @@ def insert_semantic(db, db_path, eid, at, text, provenance, salience, turns,
     if protected:
         md["protected"] = True
     vecs = embed_texts([text[:4000]])
+    conflicts = find_conflicts(db, text, vecs[0] if vecs else None)
+    if conflicts:
+        md["possible_conflict_with"] = conflicts
     db.execute(
         """INSERT INTO memory_item
            (id, created, updated, project, session_key, type, content,
@@ -1065,7 +1241,8 @@ def auto_sleep(db_path):
         m = re.search(r"distilled (\d+)", summary)
         n = int(m.group(1)) if m else 0
         if n:
-            print(f"auto-sleep: {summary.replace('sleep: ', '')}")
+            if VERBOSE:
+                print(f"auto-sleep: {summary.replace('sleep: ', '')}")
             db = connect(db_path)
             since = state_get(db, "distills_since_sweep", 0) + n
             state_set(db, "distills_since_sweep", since)
@@ -1080,11 +1257,35 @@ def auto_sleep(db_path):
                 state_set(db, "distills_since_sweep", 0)
                 db.commit()
                 db.close()
-                print("auto-sweep: gc + dedup applied")
+                if VERBOSE:
+                    print("auto-sweep: gc + dedup applied")
         return rc
     except Exception as e:
         print(f"auto-sleep skipped: {e}", file=sys.stderr)
         return 0
+
+
+def cmd_bench(args):
+    """Read-only retrieval check on your own corpus. --queries is a JSON
+    list of [query, needle] pairs; a hit is any of the top k whose text
+    contains the needle. Tune thresholds on your data, not on ours."""
+    pairs = json.load(open(args.queries, encoding="utf-8"))
+    db = connect(args.db)
+    ranks = []
+    for q, needle in pairs:
+        hits = search_rows(db, q, args.k)
+        ix = [i for i, (r, _, _) in enumerate(hits) if needle in (r["content"] or "")]
+        ranks.append(ix[0] + 1 if ix else None)
+        if ix == [] and args.show_misses:
+            print(f"miss: {q[:80]}")
+    db.close()
+    n = len(ranks) or 1
+    at = lambda k: sum(1 for r in ranks if r and r <= k) / n
+    mrr = sum(1 / r for r in ranks if r) / n
+    print(json.dumps({"queries": len(ranks), "R@1": round(at(1), 3),
+                      "R@3": round(at(3), 3), "R@5": round(at(5), 3),
+                      "MRR": round(mrr, 3)}))
+    return 0
 
 
 def cmd_health(args):
@@ -1138,6 +1339,10 @@ def cmd_health(args):
                          "status='rejected' AND json_extract(metadata,'$.tombstone_reason') "
                          "LIKE 'gc score%'"),
         "distills_since_sweep": state_get(db, "distills_since_sweep", 0),
+        "possible_conflicts": q("SELECT COUNT(*) FROM memory_item WHERE project=? "
+                                "AND status != 'rejected' AND superseded_by IS NULL "
+                                "AND json_extract(metadata,'$.possible_conflict_with') "
+                                "IS NOT NULL", SEMANTIC_PROJECT),
         "db_rows": rows,
         "log_entries": len(seen),
         "in_db_not_in_log": len(db_ids - seen),
@@ -1161,7 +1366,11 @@ def cmd_health(args):
     if seen - db_ids:
         problems.append("log has entries the DB lacks: run reindex")
     report["problems"] = problems
-    print(json.dumps(report, indent=2))
+    if not getattr(args, "pretty", False):
+        report = {k: v for k, v in report.items() if v not in (0, {}, [], None)
+                  or k in ("problems", "lock")}
+    print(json.dumps(report, ensure_ascii=False,
+                     indent=2 if getattr(args, "pretty", False) else None))
     return 1 if problems else 0
 
 
@@ -1278,7 +1487,8 @@ def _sleep(args):
     distilled = wiped = skipped = reused = errors = 0
     for t in turns:
         md = json.loads(t["metadata"] or "{}")
-        if t["salience"] < args.min_salience and not md.get("protected"):
+        if (t["salience"] < args.min_salience and not md.get("protected")
+                and md.get("hits", 0) < SLEEP_MIN_HITS):
             skipped += 1
             continue
         group = [t["id"]] + _predecessors(db, t["id"])
@@ -1511,10 +1721,19 @@ def main():
     p = sub.add_parser("search")
     p.add_argument("--query", required=True)
     p.add_argument("--limit", type=int, default=5)
+    p.add_argument("--chars", type=int, default=SNIPPET_CHARS,
+                   help="max chars of each hit, picked around the query words")
+    p.add_argument("--budget", type=int, default=0,
+                   help="stop once ~N tokens of output are used (0 = no cap)")
+    p.add_argument("--verbose", action="store_true",
+                   help="show salience, confidence, and score")
     p.set_defaults(fn=cmd_search)
 
     p = sub.add_parser("get")
     p.add_argument("--id", required=True)
+    p.add_argument("--with-embedding", action="store_true")
+    p.add_argument("--text", action="store_true", help="print only the entry's text")
+    p.add_argument("--pretty", action="store_true")
     p.set_defaults(fn=cmd_get)
 
     p = sub.add_parser("supersede")
@@ -1562,7 +1781,14 @@ def main():
                    help="only consume turns that have settled (see AUTO)")
     p.set_defaults(fn=cmd_sleep)
 
+    p = sub.add_parser("bench", help="read-only recall check from [query, needle] pairs")
+    p.add_argument("--queries", required=True)
+    p.add_argument("--k", type=int, default=10)
+    p.add_argument("--show-misses", action="store_true")
+    p.set_defaults(fn=cmd_bench)
+
     p = sub.add_parser("health", help="read-only status; exit 1 if anything needs a look")
+    p.add_argument("--pretty", action="store_true", help="every field, indented")
     p.set_defaults(fn=cmd_health)
 
     p = sub.add_parser("end-session")
@@ -1580,7 +1806,52 @@ def main():
     if args.cmd not in ("init", "reindex") and not os.path.exists(args.db):
         print(f"no database at {args.db} — run `init` first", file=sys.stderr)
         return 1
+    if not _REPLAYING and os.path.exists(args.db):
+        try:
+            _expand_ids(args)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
     return args.fn(args)
+
+
+SHORT_ID = int(os.environ.get("MEMORYKIT_SHORT_ID", "10"))
+
+
+def short(eid):
+    """Ids are printed short (10 hex chars by default) to save tokens; any
+    unique prefix of 6+ chars is accepted wherever an id is taken."""
+    return eid[:SHORT_ID] if SHORT_ID else eid
+
+
+def resolve_id(db, ref):
+    ref = (ref or "").strip()
+    if not ref or len(ref) >= 24:
+        return ref
+    if len(ref) < 6:
+        raise ValueError(f"id prefix {ref!r} too short (need 6+ chars)")
+    m = [r[0] for r in db.execute(
+        "SELECT id FROM memory_item WHERE id LIKE ? LIMIT 2", (ref + "%",))]
+    if len(m) > 1:
+        raise ValueError(f"id prefix {ref!r} is ambiguous; give more chars")
+    return m[0] if m else ref
+
+
+def _expand_ids(args):
+    db = connect(args.db)
+    try:
+        for f in ("id", "old", "new", "restore"):
+            if isinstance(getattr(args, f, None), str) and getattr(args, f):
+                setattr(args, f, resolve_id(db, getattr(args, f)))
+        for f in ("supersedes", "parent_ids"):
+            v = getattr(args, f, None)
+            if isinstance(v, str) and v:
+                setattr(args, f, ",".join(resolve_id(db, x)
+                                          for x in v.split(",") if x.strip()))
+    except sqlite3.OperationalError:
+        pass  # not initialized yet
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":

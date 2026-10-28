@@ -56,6 +56,9 @@ class Kit:
         line = [l for l in out.splitlines() if l.startswith("saved id=")][0]
         fields = dict(kv.split("=") for kv in line.split()[1:])
         fields["id"] = line.split()[1].split("=")[1]
+        full = self.sql("SELECT id FROM memory_item WHERE id LIKE ?", (fields["id"] + "%",))
+        if len(full) == 1:
+            fields["id"] = full[0][0]  # kit prints short ids; tests use full ones
         return fields, rc, out
 
     def sql(self, q, args=()):
@@ -138,7 +141,7 @@ def run_mode(mode):
     k.run("gc", "--restore", r1["id"])
     _, out, _ = k.run("gc")
     la = k.sql("SELECT learned_at FROM memory_item WHERE id=?", (r1["id"],))[0][0]
-    check("gc: restored entry not re-flagged by next GC", r1["id"] not in out)
+    check("gc: restored entry not re-flagged by next GC", r1["id"][:10] not in out)
     check("gc: restore keeps true learned_at", la.startswith("2026-01-01"))
 
     # 4. Retrieval does not reset decay.
@@ -149,7 +152,7 @@ def run_mode(mode):
           "last_accessed_at='2026-01-01T00:00:00+00:00' WHERE id=?", (old["id"],))
     k.run("search", "--query", "garden hose remark")
     _, out, _ = k.run("gc")
-    check("gc: searching an old entry does not save it", old["id"] in out)
+    check("gc: searching an old entry does not save it", old["id"][:10] in out)
 
     # 5. Correlate: real claim ok, nonsense flagged.
     k.fresh()
@@ -175,7 +178,7 @@ def run_mode(mode):
         k.run("feedback", "--id", a["id"], "--rating", "-1")
     _, out, _ = k.run("gc")
     check("feedback: -1 x3 quarantines, twin survives",
-          a["id"] in out and b["id"] not in out, out.splitlines()[0])
+          a["id"][:10] in out and b["id"][:10] not in out, out.splitlines()[0])
 
     # 7. Promote: only on independent user/tool evidence.
     k.fresh()
@@ -333,7 +336,7 @@ def run_mode(mode):
     check("sleep: low-salience turn left live for gc", rows[lo2["id"]][1] == "confirmed")
     _, out, _ = k.run("search", "--query", "how long does the charter vote stay open")
     check("sleep: search finds the semantic entry, not the wiped turn",
-          rows[u["id"]][4] in out and u["id"] not in out)
+          rows[u["id"]][4][:10] in out and u["id"][:10] not in out)
     # refusal rules
     db = mk.connect(k.db)
     try:
@@ -467,7 +470,7 @@ def run_mode(mode):
     mk.SETTLE_TURNS = old_settle
     mk.AUTO = False
     # health
-    rc, out, _ = k.run("health")
+    rc, out, _ = k.run("health", "--pretty")
     h = json.loads(out)
     check("health: clean store reports exit 0 and no problems",
           rc == 0 and h["problems"] == [] and h["lock"] == "none"
@@ -478,13 +481,13 @@ def run_mode(mode):
                        "Standing rule: receipts are posted every Sunday night.",
                        "user-said", 7, [hc["id"]])
     db.commit(); db.close()
-    rc, out, _ = k.run("health")
+    rc, out, _ = k.run("health", "--pretty")
     h = json.loads(out)
     check("health: flags a half-finished distill and log/DB drift",
           rc == 1 and h["entry_written_not_wiped"] == 1 and h["in_db_not_in_log"] == 1,
           json.dumps(h["problems"]))
     open(lock, "w").write(json.dumps({"pid": dead, "host": socket.gethostname(), "at": "x"}))
-    rc, out, _ = k.run("health")
+    rc, out, _ = k.run("health", "--pretty")
     check("health: reports a stale lock and stays read-only",
           json.loads(out)["lock"] == "stale" and os.path.exists(lock))
     os.remove(lock)
@@ -529,7 +532,74 @@ def run_mode(mode):
     for line in distinct:
         _, o, _ = k.run("capture", "--speaker", "user", "--text", line)
         outs += o
-    check("auto: sweep runs on distill count, not on a schedule", "auto-sweep" in outs)
+    check("auto: sweep runs on distill count, and stays silent by default",
+          "auto-sweep" not in outs and "auto-sleep" not in outs
+          and k.sql("SELECT value FROM memorykit_state WHERE key='distills_since_sweep'")[0][0]
+          in ("0", "1", "2"))
+
+    # 13. Token economy: every byte printed is paid for by the reader.
+    k.fresh()
+    mk.AUTO = False
+    long_txt = ("Decision: the archive keeps every receipt. " + "filler words about nothing " * 40 +
+                "The lighthouse key is stored under the blue stone by the north gate.")
+    lt2, _, _ = k.cap("user", long_txt)
+    k.cap("user", "Rule: lighthouse visits must be logged by name at the gate.", "--salience", "9")
+    _, out, _ = k.run("search", "--query", "where is the lighthouse key stored")
+    first = out.splitlines()[0]
+    check("tokens: search line is terse (id, type, snippet; no scores)",
+          first.startswith(lt2["id"][:10] + " fact ") and "score=" not in first, first[:60])
+    check("tokens: snippet is the window around the query words, capped",
+          "blue stone" in first and len(first) < 24 + 6 + mk.SNIPPET_CHARS + 10, len(first))
+    check("tokens: salience tilts but does not outrank relevance",
+          first.startswith(lt2["id"][:10]))
+    for i in range(6):
+        k.cap("user", f"Lighthouse note {i}: the {['red','green','amber','violet','white','grey'][i]} "
+              f"lamp is checked by keeper {i} every dawn.", "--salience", "6")
+    _, out, _ = k.run("search", "--query", "lighthouse lamp keeper", "--limit", "8",
+                      "--budget", "60")
+    lines = out.strip().splitlines()
+    check("tokens: --budget caps output", 1 <= len(lines) < 8 and len(out) // 4 <= 60 + 60,
+          f"{len(lines)} lines, ~{len(out)//4} tokens")
+    _, out, _ = k.run("get", "--id", lt2["id"])
+    check("tokens: get omits the embedding vector by default",
+          '"embedding"' not in out and "\n" not in out.strip())
+    rc, out, _ = k.run("health")
+    check("tokens: health is one compact line by default", len(out.strip().splitlines()) == 1)
+    # short ids: any unique 6+ char prefix works, ambiguity is refused
+    rc, out, _ = k.run("get", "--id", lt2["id"][:8])
+    rc2, _, err2 = k.run("get", "--id", lt2["id"][:4])
+    _, gtxt, _ = k.run("get", "--id", lt2["id"][:8], "--text")
+    check("tokens: get --text prints only the words",
+          gtxt.startswith("Decision: the archive") and "{" not in gtxt)
+    check("ids: short prefix resolves; too-short prefix refused",
+          rc == 0 and lt2["id"] in out and rc2 == 2 and "too short" in err2)
+    # conflict flag: same claim, different number
+    c1, _, _ = k.cap("user", "Decision: the ferry ticket costs 40 tokens per crossing.")
+    k.run("sleep", "--apply", "--no-sweep")
+    c2, _, _ = k.cap("user", "Decision: the ferry ticket costs 55 tokens per crossing.")
+    k.run("sleep", "--apply", "--no-sweep")
+    flagged = k.sql("SELECT COUNT(*) FROM memory_item WHERE project='semantic' AND "
+                    "json_extract(metadata,'$.possible_conflict_with') IS NOT NULL")[0][0]
+    rc, out, _ = k.run("health")
+    check("novelty: a changed value is not capped as a restatement", int(c2["salience"]) > 3,
+          c2["salience"])
+    check("conflict: near-identical claim with a different number is flagged, not resolved",
+          flagged == 1 and '"possible_conflicts": 1' in out, out[:120])
+    bq = os.path.join(tmp, "bq.json")
+    # Tests the bench command itself, not ranking quality (see DESIGN.md).
+    json.dump([["lighthouse key under the blue stone", "blue stone"],
+               ["ferry ticket price", "ferry ticket"]], open(bq, "w"))
+    rc, out, _ = k.run("bench", "--queries", bq)
+    check("bench: reports recall from query/needle pairs", rc == 0 and json.loads(out)["R@5"] == 1.0, out.strip())
+    # use-based distillation: a plain statement under the floor gets retrieved twice
+    pl, _, _ = k.cap("user", "The ferry to the east island leaves from pier seven.")
+    sal_pl = int(pl["salience"])
+    k.run("search", "--query", "ferry east island pier")
+    k.run("search", "--query", "which pier for the ferry")
+    k.run("sleep", "--apply", "--no-sweep")
+    st = k.sql("SELECT status FROM memory_item WHERE id=?", (pl["id"],))[0][0]
+    check("use: a low-salience turn retrieved twice is distilled anyway",
+          sal_pl < 5 and st == "rejected", f"sal={sal_pl} status={st}")
     mk.SETTLE_TURNS, mk.SWEEP_EVERY = old_settle, old_sweep
     mk.AUTO = False
 

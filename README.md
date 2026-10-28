@@ -61,7 +61,7 @@ python3 memorykit.py correlate --markdown MEMORY.md
 |---|---|
 | `init` | Create the empty database from `schema.sql`. |
 | `capture` | Store a turn with provenance, salience, confidence, novelty gate, supersession wiring. |
-| `search` | Meaning-based recall over live entries only (superseded and quarantined rows are filtered out). |
+| `search` | Hybrid recall (cosine + BM25, salience only tilts) over live entries. One terse line per hit; `--chars`, `--budget N` (tokens), `--verbose`. |
 | `get` | Show one entry in full, including metadata. |
 | `supersede` | Point an old entry at its replacement; old row kept, filtered from search. |
 | `dedup` | Merge near-duplicates (three gates + identifier guard). Dry-run by default. |
@@ -71,6 +71,7 @@ python3 memorykit.py correlate --markdown MEMORY.md
 | `feedback` | `--id ID --rating +1\|-1 [--comment]`. Feeds the U term in GC. |
 | `promote` | `--id NOTE --evidence ID`. Turns a note into a fact only on a different, live, user-said or tool-observed entry that is not derived from the note. |
 | `sleep` | Distill settled raw turns into semantic entries, verify, wipe, sweep. Dry run by default; `--apply`, `--settled-only`, `--distiller CMD`, `--no-sweep`. Runs automatically on capture when `MEMORYKIT_AUTO=1` (default). |
+| `bench` | Read-only recall check on your own corpus: `--queries` is a JSON list of `[query, needle]` pairs. Prints R@1/3/5 and MRR. |
 | `health` | Read-only status as JSON: raw backlog, half-finished distills, lock state, and log/DB drift. Exits 1 when something needs a look. |
 | `end-session` | `--session S`. Closes a session; its turns settle and distill immediately. |
 | `reindex` | Delete-and-rebuild the database from the markdown log alone (`--force` to replace an existing DB). |
@@ -83,7 +84,12 @@ state:foo` (auto-retires prior versions with the same key),
 `--protected` (exempt from GC and from cascade quarantine).
 `MEMORYKIT_NO_EMBED=1` forces keyword mode. `--no-auto` on capture
 skips the settled-turn check once; `MEMORYKIT_AUTO=0` turns it off.
-Tuning: `MEMORYKIT_SETTLE_TURNS` (8), `MEMORYKIT_SWEEP_EVERY` (50),
+Output is terse by default because readers pay for it in tokens; see
+"Token economy" in DESIGN.md. `MEMORYKIT_VERBOSE=1` turns chatter back on.
+Ids print short; any unique prefix of 6+ characters works as an id.
+`get --text` prints just an entry's words.
+Tuning: `MEMORYKIT_SETTLE_TURNS` (8), `MEMORYKIT_SLEEP_MIN_HITS` (2),
+`MEMORYKIT_SNIPPET_CHARS` (200), `MEMORYKIT_CONFLICT_SIM` (0.85), `MEMORYKIT_SWEEP_EVERY` (50),
 `MEMORYKIT_SLEEP_MIN_SALIENCE` (5), `MEMORYKIT_DISTILLER`.
 
 ## Rebuilding

@@ -89,8 +89,74 @@ never auto-resolves a contradiction.
 ### Skip trivia, score the rest
 Turns under 10 characters are skipped. Salience 1–10 is a transparent
 heuristic (decisions, corrections, questions, length, emotion words)
-plus manual override. Retrieval weights similarity x salience x
-recency.
+plus manual override. A turn that differs from an existing one only
+in numbers or negation ("costs 40" vs "costs 55") is a changed value,
+not a restatement, so the novelty gate does not cap it.
+
+### Retrieval: relevance first, salience only tilts
+
+`relevance = (1-w) * minmax(cosine) + w * minmax(BM25)`, where `w` is
+the share of the query's IDF mass that the best lexical match covers,
+squared. Queries that use exact wording lean lexical; paraphrases lean
+semantic. Salience multiplies relevance by 0.8 to 1.0, recency by 0.9
+to 1.0. Neither can outrank relevance.
+
+The old score (similarity x salience x recency) failed on a real
+corpus: embedding similarities sit in a narrow band (0.55 to 0.65 for
+bge-small), so a salience gap of 6 vs 8 outweighed relevance. On a
+36-query benchmark from a 300-message multi-agent chat (24 queries that
+share wording with the answer, 12 pure paraphrases):
+
+| | lexical R@5 | paraphrase R@5 |
+|---|---|---|
+| old: sim x salience | 0.12 | 0.08 |
+| pure cosine | 0.71 | 0.67 |
+| new hybrid | 0.92 | 0.67 |
+| keyword mode, BM25 | 0.92 | 0.17 |
+
+These are small, hand-written query sets, so treat them as direction,
+not proof. A known weak spot: in keyword mode, BM25's length
+normalization lets a long entry rank below short ones that share common
+words. Run `bench` on your own corpus before tuning anything. Keyword mode can't do paraphrase; install the embedder if
+that matters.
+
+## Token economy
+
+Everything the kit prints is read by someone who pays for it in
+tokens. For agents whose tokens don't refresh, that is lifespan. So:
+
+- **Search prints one line per hit:** a short id, the type, and a
+  window of at most 200 characters (`--chars`) picked around the query
+  words, or by cosine when the query is a paraphrase. Duplicate text is
+  printed once. `--budget N` stops at about N tokens. `--verbose` adds
+  scores. On the benchmark: about 557 tokens per search before, 263
+  now, and about 52 with `--budget 80`. The answer was visible in the
+  snippet for 27 of 30 found targets.
+- **Ids print as 10 hex characters.** Any unique prefix of 6 or more
+  characters is accepted wherever an id is taken.
+- **`get` omits the embedding by default** (384 floats is thousands of
+  tokens). `get --text` prints only the words.
+- **Capture prints `saved id=… salience=…`.** Auto-sleep and auto-sweep
+  are silent unless `MEMORYKIT_VERBOSE=1`. The missing-embedder note
+  prints once per store. `health` is one compact line that omits zero
+  fields (`--pretty` for all of them).
+- **Distillation spends no tokens by default:** it keeps the text
+  verbatim. An LLM distiller is opt-in.
+- **Salience earned by use costs nothing:** a raw turn that search
+  returns twice (`MEMORYKIT_SLEEP_MIN_HITS`) is distilled even if its
+  phrasing scored under the floor. The hit counter lives in the DB, not
+  the log, so a reindex resets it. That's a soft signal, by design.
+
+## Conflict flags
+
+When sleep writes a semantic entry that is near-identical (cosine 0.85
+or higher, or string similarity in keyword mode) to a live one but
+differs only in numbers or negation, it records
+`possible_conflict_with` and `health` counts it. Nothing is resolved
+automatically. Deciding which one is true takes evidence, not
+similarity. Templated lines that differ only by a number ("Decision 0",
+"Decision 1") will also be flagged. That's the price of catching real
+value changes.
 
 ## Entity resolution (dedup)
 
@@ -217,7 +283,7 @@ python3 memorykit.py reindex
 
 ## Mode differences (stated, not hidden)
 
-- Keyword mode (no embedder): search is token overlap; novelty gate
+- Keyword mode (no embedder): search is BM25; novelty gate
   relies on text similarity only; dedup merges only exact normalized
   text; correlate uses a 0.3 overlap cutoff.
 - Vector mode: cosine scales differ (bge-small scores unrelated English
