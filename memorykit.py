@@ -922,8 +922,17 @@ def cmd_promote(args):
 # distilled_from edge) and only wipes. If the wipe happened but its log line
 # did not, a reindex brings the turn back and the next run wipes it again.
 
+_HEADER = re.compile(r"^\s*\[turn provenance=[^\]]*\]\s*$")
+
+
 def _body(content):
-    return re.sub(r"^\[turn provenance=[^\]]*\]\n", "", content or "")
+    """Strip every leading provenance-header line. The kit writes exactly one
+    header itself; any header-shaped line in distilled text is forged or
+    stale and must not reach search display."""
+    lines = (content or "").split("\n")
+    while lines and _HEADER.match(lines[0]):
+        lines.pop(0)
+    return "\n".join(lines).strip()
 
 
 def _run_distiller(cmd, payload):
@@ -937,7 +946,7 @@ def _run_distiller(cmd, payload):
     if res.returncode != 0:
         raise RuntimeError(f"distiller exit {res.returncode}: {res.stderr[:200]}")
     out = json.loads(res.stdout)
-    text = (out.get("text") or "").strip()
+    text = _body(out.get("text") or "")
     if len(text) < 10:
         raise RuntimeError("distiller returned empty text")
     return text
