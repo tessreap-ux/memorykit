@@ -71,6 +71,7 @@ python3 memorykit.py correlate --markdown MEMORY.md
 | `feedback` | `--id ID --rating +1\|-1 [--comment]`. Feeds the U term in GC. |
 | `promote` | `--id NOTE --evidence ID`. Turns a note into a fact only on a different, live, user-said or tool-observed entry that is not derived from the note. |
 | `sleep` | Distill settled raw turns into semantic entries, verify, wipe, sweep. Dry run by default; `--apply`, `--settled-only`, `--distiller CMD`, `--no-sweep`. Runs automatically on capture when `MEMORYKIT_AUTO=1` (default). |
+| `health` | Read-only status as JSON: raw backlog, half-finished distills, lock state, and log/DB drift. Exits 1 when something needs a look. |
 | `end-session` | `--session S`. Closes a session; its turns settle and distill immediately. |
 | `reindex` | Delete-and-rebuild the database from the markdown log alone (`--force` to replace an existing DB). |
 
@@ -138,3 +139,33 @@ templates/
   daily-log.md          daily log template
   WORKING-MEMORY.md     shared group working-memory template
 ```
+
+
+## Trust: what this kit does and doesn't do
+
+Written for users who audit before they install.
+
+- **Files it writes:** the SQLite DB you name, its markdown log directory
+  (`memory-log/` next to the DB, or `MEMORYKIT_MD_DIR`), and a
+  `<db>.sleep.lock` file while sleep runs. Nothing else.
+- **Network:** none of its own. The optional embedder (`fastembed`)
+  downloads its model once on first use. `MEMORYKIT_NO_EMBED=1` runs
+  fully offline in keyword mode.
+- **No telemetry, no background process, no daemon.** Work happens only
+  inside a command you ran, including auto-sleep, which runs inside
+  `capture`.
+- **`--distiller` / `MEMORYKIT_DISTILLER` runs a shell command you
+  supply.** That is the only place the kit executes anything external.
+  Leave it unset and nothing runs.
+- **Nothing is hard-deleted.** Wipes, supersessions, and GC are
+  tombstones. Every one is in the log and can be restored, and `reindex`
+  rebuilds the whole DB from the log.
+- **The provenance firewall is enforced in code, not by prompt.** A
+  distiller can change wording, never type or provenance. Header-shaped
+  lines in its output are stripped, after NFKC normalization and
+  removal of zero-width characters.
+- **Stale locks clear themselves, visibly:** if the PID that holds a lock
+  is gone (same host), or the lock is older than
+  `MEMORYKIT_LOCK_TIMEOUT` (3600s), the next run clears it and prints
+  that. A live lock is reported, never skipped silently.
+- Single file, standard library plus optional `fastembed`. Read it.

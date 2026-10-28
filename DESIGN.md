@@ -185,7 +185,15 @@ Order, every time: **collect → distill → verify → wipe → sweep.**
   the entry but before the wipe, the next run finds the entry by its
   edge, re-logs it, and only wipes. If the wipe's log line was lost, a
   reindex revives the turn and the next run wipes it again. A lock file
-  stops two runs from overlapping.
+  stops two runs from overlapping. It records PID, host, and time. A lock
+  whose PID is gone on this host, or one older than
+  `MEMORYKIT_LOCK_TIMEOUT`, is cleared by the next run, with a message.
+  A held lock is reported even by auto-sleep, so a stall can't go
+  unnoticed.
+- `health` is read-only and reports what an unattended run can't see
+  for itself: the settled backlog, entries written but not yet wiped,
+  lock state, and rows that are in the DB but not the log (those would
+  be lost on reindex).
 
 ## Cross-layer audit (correlate)
 

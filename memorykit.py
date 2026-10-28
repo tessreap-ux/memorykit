@@ -39,6 +39,8 @@ Usage:
   python3 memorykit.py promote --id NOTE_ID --evidence EVIDENCE_ID
   python3 memorykit.py reindex [--md-dir DIR] [--force]
   python3 memorykit.py sleep [--apply] [--min-age-hours H] [--distiller CMD]
+  python3 memorykit.py end-session --session S
+  python3 memorykit.py health
 
 Every capture and state change is also appended to ./memory-log/YYYY-MM-DD.md
 (override with MEMORYKIT_MD_DIR), which is what `reindex` rebuilds from.
@@ -47,6 +49,8 @@ import argparse
 import contextlib
 import datetime
 import io
+import time
+import unicodedata
 import difflib
 import json
 import math
@@ -927,12 +931,21 @@ _HEADER = re.compile(r"^\s*\[\s*turn\s+provenance\s*[=:]\s*[^\]]*\]\s*$",
                      re.IGNORECASE)
 
 
+_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"))
+
+
+def _looks_like_header(line):
+    # Match on a normalized copy (NFKC folds fullwidth brackets and the like,
+    # zero-width characters are dropped); the stored text itself is untouched.
+    return bool(_HEADER.match(unicodedata.normalize("NFKC", line).translate(_ZERO_WIDTH)))
+
+
 def _body(content):
     """Strip every leading provenance-header line. The kit writes exactly one
     header itself; any header-shaped line in distilled text is forged or
     stale and must not reach search display."""
     lines = (content or "").split("\n")
-    while lines and _HEADER.match(lines[0]):
+    while lines and _looks_like_header(lines[0]):
         lines.pop(0)
     return "\n".join(lines).strip()
 
@@ -1074,6 +1087,84 @@ def auto_sleep(db_path):
         return 0
 
 
+def cmd_health(args):
+    """Read-only. One JSON object; exit 0 healthy, 1 if anything needs a look."""
+    db = connect(args.db)
+    q = lambda sql, *a: db.execute(sql, a).fetchone()[0]
+    raw_live = q("SELECT COUNT(*) FROM memory_item WHERE project != ? AND "
+                 "status != 'rejected' AND superseded_by IS NULL", SEMANTIC_PROJECT)
+    sel = argparse.Namespace(db=args.db, apply=False, min_age_hours=0.0,
+                             min_salience=SLEEP_MIN_SALIENCE, distiller="",
+                             no_sweep=True, settled_only=True)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        _sleep(sel)
+    backlog = sum(1 for ln in out.getvalue().splitlines()
+                  if ln.startswith("would distill") and "[reuse]" not in ln)
+    reuse = q("SELECT COUNT(DISTINCT t.id) FROM memory_item t JOIN memory_edge e "
+              "ON e.object_id = t.id AND e.predicate='distilled_from' "
+              "JOIN memory_item p ON p.id = e.subject_id "
+              "WHERE t.status != 'rejected' AND p.status != 'rejected' "
+              "AND p.superseded_by IS NULL")
+    oldest = db.execute(
+        "SELECT MIN(learned_at) FROM memory_item WHERE project != ? AND "
+        "status != 'rejected' AND superseded_by IS NULL",
+        (SEMANTIC_PROJECT,)).fetchone()[0]
+    db_ids = {r[0] for r in db.execute("SELECT id FROM memory_item")}
+    rows = len(db_ids)
+    seen = set()
+    d = md_dir_for(args.db)
+    if os.path.isdir(d):
+        for f in sorted(os.listdir(d)):
+            if f.endswith(".md"):
+                for line in open(os.path.join(d, f), encoding="utf-8"):
+                    m = MK_RE.search(line)
+                    if m:
+                        rec = json.loads(m.group(1))
+                        if rec.get("op") in ("capture", "distill") and rec.get("id"):
+                            seen.add(rec["id"])
+    state, info = lock_status(args.db + ".sleep.lock")
+    report = {
+        "raw_live": raw_live,
+        "settled_backlog": backlog,
+        "entry_written_not_wiped": reuse,
+        "oldest_live_raw": oldest,
+        "semantic_live": q("SELECT COUNT(*) FROM memory_item WHERE project=? AND "
+                           "status != 'rejected' AND superseded_by IS NULL",
+                           SEMANTIC_PROJECT),
+        "wiped": q("SELECT COUNT(*) FROM memory_item WHERE "
+                   "json_extract(metadata,'$.distilled_into') IS NOT NULL"),
+        "quarantined": q("SELECT COUNT(*) FROM memory_item WHERE "
+                         "status='rejected' AND json_extract(metadata,'$.tombstone_reason') "
+                         "LIKE 'gc score%'"),
+        "distills_since_sweep": state_get(db, "distills_since_sweep", 0),
+        "db_rows": rows,
+        "log_entries": len(seen),
+        "in_db_not_in_log": len(db_ids - seen),
+        "in_log_not_in_db": len(seen - db_ids),
+        "lock": state,
+        "lock_info": info,
+        "auto": AUTO,
+    }
+    db.close()
+    problems = []
+    if state == "stale":
+        problems.append("stale lock (next sleep run clears it)")
+    if state == "held" and info.get("age_s", 0) > LOCK_TIMEOUT / 2:
+        problems.append("lock held a long time")
+    if backlog > SETTLE_TURNS * 4:
+        problems.append("settled turns piling up: is auto-sleep running?")
+    if reuse:
+        problems.append("entries written but turns not wiped: run sleep --apply")
+    if db_ids - seen:
+        problems.append("rows missing from the log are lost on reindex")
+    if seen - db_ids:
+        problems.append("log has entries the DB lacks: run reindex")
+    report["problems"] = problems
+    print(json.dumps(report, indent=2))
+    return 1 if problems else 0
+
+
 def cmd_end_session(args):
     """Close a session: its turns become settled and are distilled now."""
     db = connect(args.db)
@@ -1094,17 +1185,68 @@ def cmd_end_session(args):
     return 0
 
 
+LOCK_TIMEOUT = int(os.environ.get("MEMORYKIT_LOCK_TIMEOUT", "3600"))
+
+
+def lock_status(lock):
+    """('none'|'held'|'stale', info). Stale means: same host and the PID is
+    gone, or the lock is older than LOCK_TIMEOUT. Read-only."""
+    import socket
+    if not os.path.exists(lock):
+        return "none", {}
+    try:
+        info = json.loads(open(lock).read())
+    except (ValueError, OSError):
+        info = {}
+    age = time.time() - os.path.getmtime(lock)
+    info["age_s"] = int(age)
+    pid, host = info.get("pid"), info.get("host")
+    if pid and host == socket.gethostname():
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return "stale", info
+        except PermissionError:
+            pass  # alive, owned by someone else
+        else:
+            if age <= LOCK_TIMEOUT:
+                return "held", info
+    return ("stale" if age > LOCK_TIMEOUT else "held"), info
+
+
+def acquire_lock(lock):
+    import socket
+    for attempt in (1, 2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, json.dumps({"pid": os.getpid(),
+                                     "host": socket.gethostname(),
+                                     "at": now_iso()}).encode())
+            os.close(fd)
+            return True, {}
+        except FileExistsError:
+            state, info = lock_status(lock)
+            if state == "stale" and attempt == 1:
+                # Clear it, say so, and retry once. Every clear is visible.
+                try:
+                    os.remove(lock)
+                except FileNotFoundError:
+                    pass
+                print(f"cleared stale sleep lock (pid {info.get('pid')}, "
+                      f"age {info.get('age_s')}s)", file=sys.stderr)
+                continue
+            return False, info
+    return False, {}
+
+
 def cmd_sleep(args):
     lock = args.db + ".sleep.lock"
     if args.apply:
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-        except FileExistsError:
-            if not getattr(args, "quiet_lock", False):
-                print(f"another sleep run holds {lock}; remove it if stale",
-                      file=sys.stderr)
+        ok, info = acquire_lock(lock)
+        if not ok:
+            # Never silent, even from auto-sleep: a held lock means work waits.
+            print(f"sleep skipped: lock held by pid {info.get('pid')} for "
+                  f"{info.get('age_s')}s ({lock})", file=sys.stderr)
             return 3
     try:
         return _sleep(args)
@@ -1419,6 +1561,9 @@ def main():
     p.add_argument("--settled-only", action="store_true",
                    help="only consume turns that have settled (see AUTO)")
     p.set_defaults(fn=cmd_sleep)
+
+    p = sub.add_parser("health", help="read-only status; exit 1 if anything needs a look")
+    p.set_defaults(fn=cmd_health)
 
     p = sub.add_parser("end-session")
     p.add_argument("--session", required=True)

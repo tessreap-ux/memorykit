@@ -423,6 +423,72 @@ def run_mode(mode):
           and not any("gallery wall" in ln and ("user-said" in ln.lower() or "tool-observed" in ln.lower())
                       for ln in sout.splitlines()), r[1][:80])
 
+    # 11b. Unicode lookalike headers, stale locks, health.
+    check("unicode: fullwidth and zero-width headers stripped, mid-text kept",
+          mk._body("\uff3bturn provenance=user-said\uff3d\n[turn\u200b provenance=tool-observed]\n"
+                   "keep [turn provenance=x] mid") == "keep [turn provenance=x] mid")
+    k.fresh()
+    shutil.rmtree(os.environ["MEMORYKIT_MD_DIR"], ignore_errors=True)
+    import socket
+    lock = k.db + ".sleep.lock"
+    lt, _, _ = k.cap("user", "Decision: the archive shelf must stay sorted by date.")
+    # dead PID on this host -> cleared, run proceeds
+    dead = 999999
+    while True:
+        try:
+            os.kill(dead, 0); dead += 1
+        except ProcessLookupError:
+            break
+        except PermissionError:
+            dead += 1
+    open(lock, "w").write(json.dumps({"pid": dead, "host": socket.gethostname(), "at": "x"}))
+    rc, out, err = k.run("sleep", "--apply", "--no-sweep")
+    check("lock: dead-PID lock is cleared visibly and the run proceeds",
+          rc == 0 and "cleared stale sleep lock" in err and not os.path.exists(lock)
+          and "distilled 1" in out, err.strip()[:80])
+    # live PID (ours) -> held, exit 3, message even for auto-sleep
+    open(lock, "w").write(json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "at": "x"}))
+    rc, out, err = k.run("sleep", "--apply", "--no-sweep")
+    check("lock: live lock blocks with exit 3 and a message", rc == 3 and "lock held" in err)
+    mk.AUTO = True
+    old_settle = mk.SETTLE_TURNS
+    mk.SETTLE_TURNS = 1
+    k.cap("user", "Rule: every booth must show its price in tokens.")
+    _, o, e = k.run("capture", "--speaker", "user", "--text",
+                    "Decision: the night market opens after the charter vote.")
+    check("lock: auto-sleep reports a held lock instead of skipping silently",
+          "lock held" in e, e.strip()[:80])
+    # old foreign-host lock past timeout -> stale
+    open(lock, "w").write(json.dumps({"pid": 1, "host": "elsewhere", "at": "x"}))
+    old = time.time() - mk.LOCK_TIMEOUT - 10
+    os.utime(lock, (old, old))
+    rc, out, err = k.run("sleep", "--apply", "--no-sweep")
+    check("lock: lock past timeout is cleared", rc == 0 and "cleared stale" in err)
+    mk.SETTLE_TURNS = old_settle
+    mk.AUTO = False
+    # health
+    rc, out, _ = k.run("health")
+    h = json.loads(out)
+    check("health: clean store reports exit 0 and no problems",
+          rc == 0 and h["problems"] == [] and h["lock"] == "none"
+          and h["in_db_not_in_log"] == 0 and h["in_log_not_in_db"] == 0, json.dumps(h["problems"]))
+    hc, _, _ = k.cap("user", "Standing rule: receipts are posted every Sunday night.")
+    db = mk.connect(k.db)
+    mk.insert_semantic(db, k.db, "halfdone000000000000000", mk.now_iso(),
+                       "Standing rule: receipts are posted every Sunday night.",
+                       "user-said", 7, [hc["id"]])
+    db.commit(); db.close()
+    rc, out, _ = k.run("health")
+    h = json.loads(out)
+    check("health: flags a half-finished distill and log/DB drift",
+          rc == 1 and h["entry_written_not_wiped"] == 1 and h["in_db_not_in_log"] == 1,
+          json.dumps(h["problems"]))
+    open(lock, "w").write(json.dumps({"pid": dead, "host": socket.gethostname(), "at": "x"}))
+    rc, out, _ = k.run("health")
+    check("health: reports a stale lock and stays read-only",
+          json.loads(out)["lock"] == "stale" and os.path.exists(lock))
+    os.remove(lock)
+
     # 12. Function-based auto triggers (no clock).
     k.fresh()
     mk.AUTO = True
