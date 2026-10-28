@@ -1254,7 +1254,7 @@ def find_conflicts(db, text, vec):
 
 
 def insert_semantic(db, db_path, eid, at, text, provenance, salience, turns,
-                    supersession_key="", protected=False, source=""):
+                    supersession_key="", protected=False, source="", quote=None):
     if db.execute("SELECT 1 FROM memory_item WHERE id=?", (eid,)).fetchone():
         return  # idempotent: replay or a re-logged record
     mtype, confidence = PROVENANCE[provenance]
@@ -1266,6 +1266,8 @@ def insert_semantic(db, db_path, eid, at, text, provenance, salience, turns,
         md["protected"] = True
     if source:
         md["source"] = source
+    if quote:
+        md["quote"] = quote  # metadata only: never indexed as this speaker's words
     vecs = embed_texts([text[:4000]])
     conflicts = find_conflicts(db, text, vecs[0] if vecs else None)
     if conflicts:
@@ -1639,6 +1641,7 @@ def _sleep(args):
                                  "supersession_key": emd.get("supersession_key", ""),
                                  "protected": bool(emd.get("protected")),
                                  "source": emd.get("source", ""),
+                                 "quote": emd.get("quote", {}),
                                  "relogged": True},
                        f"[distilled, re-logged] {_body(er['content'])}")
             else:
@@ -1654,14 +1657,15 @@ def _sleep(args):
                                 t["salience"], group,
                                 md.get("supersession_key", ""),
                                 bool(md.get("protected")),
-                                md.get("source", ""))
+                                md.get("source", ""), md.get("quote") or None)
                 db.commit()
                 log_md(args.db, {"op": "distill", "id": parent, "at": at,
                                  "text": text, "provenance": prov,
                                  "salience": t["salience"], "turns": group,
                                  "supersession_key": md.get("supersession_key", ""),
                                  "protected": bool(md.get("protected")),
-                                 "source": md.get("source", "")},
+                                 "source": md.get("source", ""),
+                                 "quote": md.get("quote", {})},
                        f"[distilled {prov}] {text}")
                 distilled += 1
             # verify, then wipe
@@ -1788,7 +1792,7 @@ def cmd_reindex(args):
                                 rec["provenance"], rec["salience"], rec["turns"],
                                 rec.get("supersession_key", ""),
                                 rec.get("protected", False),
-                                rec.get("source", ""))
+                                rec.get("source", ""), rec.get("quote") or None)
                 db.commit()
                 db.close()
             elif op == "end_session":

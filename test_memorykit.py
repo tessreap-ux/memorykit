@@ -585,6 +585,14 @@ def run_mode(mode):
     sem = k.sql("SELECT metadata FROM memory_item WHERE project='semantic'")
     check("attribution: source survives distillation",
           sorted(json.loads(m[0]).get("source") for m in sem) == ["Ada", "Ben"], sem)
+    sq = [json.loads(m[0]) for m in sem if json.loads(m[0]).get("source") == "Ada"]
+    check("attribution: quote survives distillation (reported by Muse against v4.3)",
+          sq and sq[0].get("quote") == {"source": "Ben", "text": "The bridge toll doubles in spring."},
+          sq[0].get("quote") if sq else None)
+    sc = k.sql("SELECT content FROM memory_item WHERE project='semantic' AND "
+               "json_extract(metadata,'$.source')='Ada'")[0][0]
+    check("attribution: distilled entry still keeps the quote out of its content",
+          "doubles" not in sc)
     md = json.loads(k.sql("SELECT metadata FROM memory_item WHERE id=?", (qa["id"],))[0][0])
     check("attribution: quote kept in metadata, out of indexed content",
           md["quote"] == {"source": "Ben", "text": "The bridge toll doubles in spring."}
