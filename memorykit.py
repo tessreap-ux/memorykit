@@ -38,6 +38,9 @@ Usage:
   python3 memorykit.py feedback --id ID --rating +1|-1 [--comment "..."]
   python3 memorykit.py promote --id NOTE_ID --evidence EVIDENCE_ID
   python3 memorykit.py reindex [--md-dir DIR] [--force]
+  python3 memorykit.py pre-turn --query "..." [--budget N] [--prefer-source NAME]
+  python3 memorykit.py post-turn --jsonl < turns.jsonl      # or --speaker/--text
+  python3 memorykit.py upgrade                # in-place migration from 4.x
   python3 memorykit.py sleep [--apply] [--min-age-hours H] [--distiller CMD]
   python3 memorykit.py end-session --session S
   python3 memorykit.py health
@@ -68,7 +71,7 @@ MODEL = os.environ.get("MEMORYKIT_MODEL", "BAAI/bge-small-en-v1.5")
 MODEL_DIR = os.environ.get("MEMORYKIT_MODEL_DIR") or os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
     "memorykit", "models")
-VERSION = "4.5.0"
+VERSION = "5.0.0"
 
 # Provenance -> (entry type, default confidence). Agent-originated content
 # is NEVER stored as fact: only user statements and tool observations earn
@@ -118,19 +121,19 @@ GC_NOISE_FLOOR = 0.05
 CORRELATE_KEYWORD_MIN = 0.3
 CORRELATE_COSINE_MIN = float(os.environ.get("MEMORYKIT_CORRELATE_COS", "0.75"))
 GC_QUARANTINE_DAYS = 30
-# Sleep (nightly distill): raw turns at or above this salience are distilled
+# Distill: raw turns at or above this salience are distilled
 # into semantic entries and then wiped; below it they are left for GC.
 SLEEP_MIN_SALIENCE = int(os.environ.get("MEMORYKIT_SLEEP_MIN_SALIENCE", "5"))
 SEMANTIC_PROJECT = "semantic"
 # Function-based triggers (no clock). With MEMORYKIT_AUTO=1 (default) every
-# capture checks whether any raw turn has SETTLED, and distills just those:
-#   * its session was closed with `end-session`, or
+# post-turn (and every legacy capture) runs one bounded upkeep step (see the
+# v5 section). A raw turn is SETTLED, and may be distilled, when:
 #   * SETTLE_TURNS newer captures have arrived since it (it has left the
-#     working window, so a quick follow-up correction is no longer likely).
-# A sweep (gc + dedup) runs after every SWEEP_EVERY distills, not nightly.
+#     working window, so a quick follow-up correction is no longer likely), or
+#   * it is older than SETTLE_HOURS (so a session nobody closes still drains), or
+#   * its session was closed with the optional `end-session`.
 AUTO = os.environ.get("MEMORYKIT_AUTO", "1") == "1"
 SETTLE_TURNS = int(os.environ.get("MEMORYKIT_SETTLE_TURNS", "8"))
-SWEEP_EVERY = int(os.environ.get("MEMORYKIT_SWEEP_EVERY", "50"))
 AUTO_DISTILLER = os.environ.get("MEMORYKIT_DISTILLER", "")
 # Output is paid for in tokens by whoever reads it. Defaults are terse.
 VERBOSE = os.environ.get("MEMORYKIT_VERBOSE", "0") == "1"
@@ -189,8 +192,16 @@ _MIGRATED = set()
 
 
 def connect(db_path):
-    db = sqlite3.connect(db_path)
+    db = sqlite3.connect(db_path, timeout=10)
     db.row_factory = sqlite3.Row
+    try:
+        # v5: WAL so a reader never blocks the per-turn writer, FULL sync so a
+        # committed turn survives power loss (the capture journal covers the
+        # rest). Persistent per file; harmless if the file is read-only.
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+    except sqlite3.OperationalError:
+        pass
     key = os.path.abspath(db_path)
     if key not in _MIGRATED:
         try:
@@ -536,6 +547,11 @@ def cmd_capture(args):
         metadata["parent_ids"] = parent_ids
     content = f"[turn provenance={provenance}]\n{text}"
     new_id = getattr(args, "force_id", None) or uuid.uuid4().hex[:24]
+    if getattr(args, "force_id", None) and db.execute(
+            "SELECT 1 FROM memory_item WHERE id=?", (new_id,)).fetchone():
+        db.close()  # idempotent: a replayed or retried turn is already stored
+        print(f"exists id={short(new_id)}")
+        return 0
     now = getattr(args, "force_at", None) or now_iso()
     if args.protected:
         metadata["protected"] = True
@@ -589,21 +605,23 @@ def cmd_capture(args):
             (uuid.uuid4().hex[:24], now, now, args.project, new_id, parent, new_id))
     db.commit()
     db.close()
-    log_md(args.db, {
-        "op": "capture", "id": new_id, "at": now, "speaker": args.speaker,
-        "provenance": provenance, "text": text, "salience": salience,
-        "salience_manual": bool(args.salience), "project": args.project,
-        "session": args.session or "", "turn": args.turn,
-        "supersedes": sorted(set(retired)), "supersession_key": skey or "",
-        "parents": parent_ids, "protected": bool(args.protected),
-        "novelty": novelty, "source": src,
-        "quote": metadata.get("quote", {})},
-        f"[{provenance}] {text}")
+    _crash("after_commit")
+    if not getattr(args, "no_log", False):
+        log_md(args.db, {
+            "op": "capture", "id": new_id, "at": now, "speaker": args.speaker,
+            "provenance": provenance, "text": text, "salience": salience,
+            "salience_manual": bool(args.salience), "project": args.project,
+            "session": args.session or "", "turn": args.turn,
+            "supersedes": sorted(set(retired)), "supersession_key": skey or "",
+            "parents": parent_ids, "protected": bool(args.protected),
+            "novelty": novelty, "source": src,
+            "quote": metadata.get("quote", {})},
+            f"[{provenance}] {text}")
     # Terse receipt: the id and the one number that decides its fate.
     print(f"saved id={short(new_id)} salience={salience}"
           + (f" provenance={provenance}" if VERBOSE else ""))
     if AUTO and not _REPLAYING and not getattr(args, "no_auto", False):
-        auto_sleep(args.db)
+        upkeep_step(args.db)
     if vecs is None and not os.environ.get("MEMORYKIT_NO_EMBED"):
         db = connect(args.db)
         if not state_get(db, "warned_no_embed", False):
@@ -845,30 +863,33 @@ def snippet(text, query, width, qvec=None):
     return ("…" if start else "") + out + ("…" if end < len(text) else "")
 
 
-def cmd_search(args):
-    db = connect(args.db)
-    hits = search_rows(db, args.query, args.limit, getattr(args, "source", ""))
-    qv = embed_texts([args.query[:4000]]) if hits else None
+def search_lines(db, query, limit, chars=SNIPPET_CHARS, budget=0, source="",
+                 verbose=False, skip_ids=()):
+    """Ranked hits as terse lines within an approximate token budget
+    (4 chars a token). Bumps access stats for what it shows."""
+    hits = search_rows(db, query, limit + len(skip_ids), source)
+    qv = embed_texts([query[:4000]]) if hits else None
     qv = qv[0] if qv else None
-    budget = getattr(args, "budget", 0) or 0  # approx tokens, 4 chars each
-    used, shown, seen = 0, 0, set()
+    used, lines, ids, seen = 0, [], [], set()
     for r, score, sim in hits:
-        snip = snippet(r["content"], args.query, args.chars, qv)
+        if r["id"] in skip_ids or len(lines) >= limit:
+            continue
+        snip = snippet(r["content"], query, chars, qv)
         if snip in seen:
             continue  # identical text already shown: pay for it once
         seen.add(snip)
-        if args.verbose:
+        if verbose:
             line = (f"- id={r['id']} type={r['type']} sal={r['salience']} "
                     f"conf={r['confidence']} score={score:.3f}\n  {snip}")
         else:
             src = _source_of(r)
             line = f"{short(r['id'])} {r['type']}{'@' + src if src else ''} {snip}"
         cost = len(line) // 4 + 1
-        if budget and shown and used + cost > budget:
+        if budget and lines and used + cost > budget:
             break
-        print(line)
+        lines.append(line)
+        ids.append(r["id"])
         used += cost
-        shown += 1
         db.execute("UPDATE memory_item SET last_accessed_at=? WHERE id=?",
                    (now_iso(), r["id"]))
         if r["project"] != SEMANTIC_PROJECT:
@@ -877,9 +898,16 @@ def cmd_search(args):
             db.execute("UPDATE memory_item SET metadata=? WHERE id=?",
                        (json.dumps(md), r["id"]))
     db.commit()
+    return lines, ids
+
+
+def cmd_search(args):
+    db = connect(args.db)
+    lines, _ = search_lines(db, args.query, args.limit, args.chars,
+                            getattr(args, "budget", 0) or 0,
+                            getattr(args, "source", ""), args.verbose)
     db.close()
-    if not hits:
-        print("(no matches)")
+    print("\n".join(lines) if lines else "(no matches)")
 
 
 def cmd_get(args):
@@ -1268,7 +1296,7 @@ def cmd_promote(args):
 
 # ---------------------------------------------------------------- sleep
 #
-# The nightly distill ("synthetic sleep"):
+# The distill ("synthetic sleep"), run a slice per turn since v5:
 #   1. collect  live raw turns (project != semantic) older than --min-age-hours
 #   2. distill  each turn at/above SLEEP_MIN_SALIENCE into ONE semantic entry,
 #               linked to the turn and its superseded predecessors by
@@ -1444,43 +1472,507 @@ def is_settled(db, t):
     return newer >= SETTLE_TURNS
 
 
-def auto_sleep(db_path):
-    """Called after every capture. Distills only settled turns; sweeps on
-    distill count. Quiet unless it did something. Never raises."""
+# ---------------------------------------------------------------- v5: per-turn
+#
+# There is no end-of-day pass. Everything happens inside the two hooks an
+# agent already calls every turn:
+#
+#   pre_turn(query)   start of turn: finish any half-done write left by a
+#                     crash, then search and return hits within a token budget.
+#   post_turn(turns)  end of turn: journal the turns (fsync), apply them
+#                     idempotently, then run ONE bounded upkeep step.
+#
+# Upkeep is amortized: each post_turn distills at most a couple of settled
+# turns, GC-scores a small window of rows from a rolling cursor, and
+# dedup-checks a few more. Decay is never "run": gc_score computes it from
+# timestamps at the moment a row is looked at. Every step is its own SQLite
+# transaction and safe to repeat, so a kill at any point loses nothing and
+# the next call (pre or post, any session, any day) picks up where it was.
+
+SETTLE_HOURS = float(os.environ.get("MEMORYKIT_SETTLE_HOURS", "6"))
+UPKEEP_DISTILL = int(os.environ.get("MEMORYKIT_UPKEEP_DISTILL", "2"))
+UPKEEP_GC_ROWS = int(os.environ.get("MEMORYKIT_UPKEEP_GC_ROWS", "25"))
+UPKEEP_DEDUP_ROWS = int(os.environ.get("MEMORYKIT_UPKEEP_DEDUP_ROWS", "8"))
+JOURNAL_COMPACT_BYTES = int(os.environ.get("MEMORYKIT_JOURNAL_COMPACT", "65536"))
+# Test hook only: kill the process hard at a named point.
+_CRASH_AT = os.environ.get("MEMORYKIT_TEST_CRASH_AT", "")
+
+
+def _crash(point):
+    if _CRASH_AT == point:
+        os._exit(137)
+
+
+_LOCKS = {}
+
+
+@contextlib.contextmanager
+def writer_lock(db_path, timeout=60.0):
+    """One writer per database across processes (flock on <db>.lock).
+    The kernel drops it when the process dies, so a crash can never leave a
+    stale lock behind. Re-entrant within a process."""
+    key = os.path.abspath(db_path)
+    ent = _LOCKS.get(key)
+    if ent:
+        ent[1] += 1
+        try:
+            yield
+        finally:
+            ent[1] -= 1
+        return
     try:
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            rc = cmd_sleep(argparse.Namespace(
-                db=db_path, apply=True, min_age_hours=0.0,
-                min_salience=SLEEP_MIN_SALIENCE, distiller=AUTO_DISTILLER,
-                no_sweep=True, settled_only=True, quiet_lock=True))
-        line = out.getvalue().strip().splitlines()
-        summary = line[-1] if line else ""
-        m = re.search(r"distilled (\d+)", summary)
-        n = int(m.group(1)) if m else 0
-        if n:
-            if VERBOSE:
-                print(f"auto-sleep: {summary.replace('sleep: ', '')}")
-            db = connect(db_path)
-            since = state_get(db, "distills_since_sweep", 0) + n
-            state_set(db, "distills_since_sweep", since)
-            db.commit()
-            db.close()
-            if since >= SWEEP_EVERY:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    cmd_gc(argparse.Namespace(db=db_path, apply=True,
-                                              restore="", eviction_report=False))
-                    cmd_dedup(argparse.Namespace(db=db_path, apply=True))
-                db = connect(db_path)
-                state_set(db, "distills_since_sweep", 0)
-                db.commit()
-                db.close()
-                if VERBOSE:
-                    print("auto-sweep: gc + dedup applied")
-        return rc
-    except Exception as e:
-        print(f"auto-sleep skipped: {e}", file=sys.stderr)
+        import fcntl
+    except ImportError:  # non-POSIX: fall back to SQLite's own busy handling
+        yield
+        return
+    os.makedirs(os.path.dirname(key), exist_ok=True)
+    fd = os.open(key + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.time() > deadline:
+                os.close(fd)
+                raise TimeoutError(f"writer lock busy for {timeout}s: {key}.lock")
+            time.sleep(0.05)
+    _LOCKS[key] = [fd, 1]
+    try:
+        yield
+    finally:
+        _LOCKS.pop(key, None)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def turn_id(t):
+    """Deterministic id for a turn: retrying the same turn never duplicates."""
+    import hashlib
+    key = json.dumps([t.get("session", ""), t.get("turn", ""), t.get("speaker", ""),
+                      t.get("source", ""), (t.get("text") or "").strip()],
+                     ensure_ascii=False)
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:24]
+
+
+def _journal_path(db_path):
+    return db_path + ".journal.jsonl"
+
+
+def _journal_append(db_path, objs):
+    with open(_journal_path(db_path), "a", encoding="utf-8") as fh:
+        for o in objs:
+            fh.write(json.dumps(o, ensure_ascii=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _journal_read(db_path):
+    """(pending records in order, set of done ids). A torn last line from a
+    crash mid-write is skipped: its turn was never acknowledged."""
+    path = _journal_path(db_path)
+    recs, done = {}, set()
+    if not os.path.exists(path):
+        return [], done
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if "done" in o:
+                done.add(o["done"])
+            elif o.get("jid"):
+                recs.setdefault(o["jid"], o)
+    return [r for j, r in recs.items() if j not in done], done
+
+
+def _log_from_row(db_path, eid):
+    """Write the markdown-log record for a stored capture, rebuilt from the
+    row itself, so a crash between commit and log is repaired exactly."""
+    db = connect(db_path)
+    r = db.execute("SELECT * FROM memory_item WHERE id=?", (eid,)).fetchone()
+    db.close()
+    if not r:
+        return False
+    md = json.loads(r["metadata"] or "{}")
+    text = _body(r["content"])
+    speaker = {"user-said": "user", "tool-observed": "tool"}.get(
+        md.get("provenance"), "agent")
+    log_md(db_path, {
+        "op": "capture", "id": eid, "at": r["learned_at"], "speaker": speaker,
+        "provenance": md.get("provenance", "agent-said"), "text": text,
+        "salience": r["salience"], "salience_manual": md.get("salience_reason") == "manual",
+        "project": r["project"], "session": r["session_key"] or "",
+        "turn": md.get("turn") or "", "supersedes": md.get("supersedes", []),
+        "supersession_key": md.get("supersession_key", ""),
+        "parents": md.get("parent_ids", []), "protected": bool(md.get("protected")),
+        "novelty": md.get("novelty", ""), "source": md.get("source", ""),
+        "quote": md.get("quote", {})},
+        f"[{md.get('provenance', 'agent-said')}] {text}")
+    return True
+
+
+def _apply_turn(db_path, rec):
+    """Store one journaled turn (no log, no upkeep). Idempotent by jid."""
+    ns = argparse.Namespace(
+        db=db_path, speaker=rec.get("speaker", "agent"), text=rec.get("text", ""),
+        session=rec.get("session", ""), turn=rec.get("turn", ""),
+        provenance=rec.get("provenance") or None, salience=rec.get("salience"),
+        supersedes=rec.get("supersedes", ""), supersession_key=rec.get("supersession_key", ""),
+        parent_ids=rec.get("parent_ids", ""), check=False,
+        project=rec.get("project", "turns"), protected=bool(rec.get("protected")),
+        source=rec.get("source", ""), quote=rec.get("quote", ""),
+        quote_source=rec.get("quote_source", ""), no_auto=True, no_log=True,
+        force_id=rec["jid"], force_at=rec.get("at"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        return cmd_capture(ns)
+
+
+def replay_journal(db_path):
+    """Finish every journaled turn that a killed call left unfinished:
+    store it if the row is missing, log it, mark it done. Returns how many
+    turns it completed. Safe to call any time, any number of times."""
+    if not os.path.exists(_journal_path(db_path)):
         return 0
+    with writer_lock(db_path):
+        return _replay_locked(db_path)
+
+
+def _replay_locked(db_path):
+    pending, _ = _journal_read(db_path)
+    n = 0
+    for rec in pending:
+        jid = rec["jid"]
+        db = connect(db_path)
+        have = db.execute("SELECT 1 FROM memory_item WHERE id=?", (jid,)).fetchone()
+        db.close()
+        if not have:
+            try:
+                rc = _apply_turn(db_path, rec)  # a too-short turn stores nothing
+            except sqlite3.IntegrityError:
+                rc = 0  # another process stored it first: same id, same turn
+            if rc not in (0, None):
+                _journal_append(db_path, [{"done": jid, "rc": rc}])
+                continue  # refused (e.g. provenance firewall): never retried
+        _crash("before_log")
+        _log_from_row(db_path, jid)  # no-op when nothing was stored
+        _journal_append(db_path, [{"done": jid}])
+        n += 1
+    _journal_compact(db_path)
+    return n
+
+
+def _journal_compact(db_path):
+    """Drop finished records once the journal grows. Atomic rename."""
+    path = _journal_path(db_path)
+    try:
+        if os.path.getsize(path) < JOURNAL_COMPACT_BYTES:
+            return
+    except OSError:
+        return
+    pending, _ = _journal_read(db_path)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for r in pending:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _feedback_map(db, ids):
+    out = {}
+    if not ids:
+        return out
+    q = ",".join("?" * len(ids))
+    for f in db.execute(
+            f"SELECT memory_id, rating, COUNT(*) c FROM memory_feedback "
+            f"WHERE memory_id IN ({q}) GROUP BY memory_id, rating", ids).fetchall():
+        pos, neg = out.get(f["memory_id"], (0, 0))
+        if f["rating"] == "+1":
+            pos = f["c"]
+        elif f["rating"] == "-1":
+            neg = f["c"]
+        out[f["memory_id"]] = (pos, neg)
+    return out
+
+
+def _window(db, cursor_key, n):
+    """Next n live rows after the cursor (by rowid), wrapping at the end."""
+    cur = state_get(db, cursor_key, 0)
+    rows = db.execute(
+        "SELECT rowid AS rid, * FROM memory_item WHERE rowid > ? AND "
+        "status != 'rejected' AND superseded_by IS NULL ORDER BY rowid LIMIT ?",
+        (cur, n)).fetchall()
+    nxt = rows[-1]["rid"] if len(rows) == n else 0  # short read: wrap
+    return rows, nxt
+
+
+def gc_step(db_path, n=None):
+    """Score the next n rows; quarantine (reversibly) those under the floor."""
+    n = n or UPKEEP_GC_ROWS
+    db = connect(db_path)
+    rows, nxt = _window(db, "gc_cursor", n)
+    fb = _feedback_map(db, [r["id"] for r in rows])
+    at, out = now_iso(), []
+    for r in rows:
+        md = json.loads(r["metadata"] or "{}")
+        if is_exempt(r, md):
+            continue
+        sc = gc_score(r, fb)
+        if sc < GC_NOISE_FLOOR:
+            tombstone(db, r["id"], f"gc score {sc:.4f} below floor", at=at)
+            out.append((r["id"], sc))
+    state_set(db, "gc_cursor", nxt)
+    db.commit()
+    db.close()
+    for eid, sc in out:
+        log_md(db_path, {"op": "quarantine", "id": eid, "at": at,
+                         "reason": f"gc score {sc:.4f} below floor"},
+               f"quarantine {eid}")
+    return len(out)
+
+
+def dedup_step(db_path, n=None):
+    """Check the next n rows against the whole live set; merge true dups
+    through the same gates as `dedup` (cosine, text, identifier guard)."""
+    n = n or UPKEEP_DEDUP_ROWS
+    db = connect(db_path)
+    probe, nxt = _window(db, "dedup_cursor", n)
+    merged = []
+    if probe:
+        live = live_rows(db)
+        at = now_iso()
+        gone = set()
+        for p in probe:
+            if p["id"] in gone:
+                continue
+            pv = load_vec(p)
+            if pv:
+                sims = _doc_sims(db, live, pv)
+                cands = [live[i] for i in sorted(range(len(live)), key=lambda i: -sims[i])[:6]
+                         if sims[i] >= DEDUP_COSINE]
+            else:
+                key = _norm_text(p["content"])
+                cands = [r for r in live if not load_vec(r) and _norm_text(r["content"]) == key]
+            for c in cands:
+                if c["id"] == p["id"] or c["id"] in gone or c["type"] != p["type"]:
+                    continue
+                if pv:
+                    txt = difflib.SequenceMatcher(None, (p["content"] or "")[:4000],
+                                                  (c["content"] or "")[:4000]).ratio()
+                    if txt < DEDUP_TEXT or identifier_only_diff(p["content"] or "",
+                                                                c["content"] or ""):
+                        continue
+                keep, drop = sorted([p, c], key=provenance_rank)
+                db.execute("UPDATE memory_item SET superseded_by=? WHERE id=?",
+                           (keep["id"], drop["id"]))
+                tombstone(db, drop["id"], f"dedup merged into {keep['id']}", at=at)
+                gone.add(drop["id"])
+                merged.append((keep["id"], drop["id"]))
+                if drop["id"] == p["id"]:
+                    break
+    state_set(db, "dedup_cursor", nxt)
+    db.commit()
+    db.close()
+    for keep, drop in merged:
+        log_md(db_path, {"op": "supersede", "old": drop, "new": keep,
+                         "reason": "dedup", "at": now_iso()}, f"dedup {drop} -> {keep}")
+    return len(merged)
+
+
+def upkeep_step(db_path, distill=None):
+    """One bounded slice of maintenance. Never raises, never needs a lock
+    held across calls, and costs the same whether the last call was a
+    minute or a month ago."""
+    try:
+        with writer_lock(db_path, timeout=5.0):
+            return _upkeep_locked(db_path, distill)
+    except TimeoutError:
+        return {}  # another process is writing; the next turn does this slice
+
+
+def _upkeep_locked(db_path, distill=None):
+    res = {}
+    for name, fn in (
+            ("distilled", lambda: _distill_step(db_path, distill)),
+            ("quarantined", lambda: gc_step(db_path)),
+            ("merged", lambda: dedup_step(db_path))):
+        try:
+            res[name] = fn()
+        except Exception as e:  # one failing slice must not stop the turn
+            res[name] = 0
+            print(f"upkeep {name} skipped: {e}", file=sys.stderr)
+    try:
+        db = connect(db_path)
+        state_set(db, "upkeep_last", {"at": now_iso(), **res})
+        db.commit()
+        db.close()
+    except sqlite3.Error:
+        pass
+    if VERBOSE and any(res.values()):
+        print("upkeep: " + " ".join(f"{k}={v}" for k, v in res.items() if v))
+    return res
+
+
+def _distill_step(db_path, limit=None):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cmd_sleep(argparse.Namespace(
+            db=db_path, apply=True, min_age_hours=0.0,
+            min_salience=SLEEP_MIN_SALIENCE, distiller=AUTO_DISTILLER,
+            no_sweep=True, settled_only=True, quiet_lock=True,
+            limit=limit or UPKEEP_DISTILL))
+    m = re.search(r"distilled (\d+)", out.getvalue())
+    return int(m.group(1)) if m else 0
+
+
+# ------------------------------------------------- v5: the two-hook contract
+
+def pre_turn(db_path, query, budget=250, prefer_source="", limit=6,
+             chars=220):
+    """Start of turn. Repairs any interrupted write, then returns the hits
+    for `query` as terse lines within ~`budget` tokens. With prefer_source,
+    up to two slots (and ~40% of the budget) go to that speaker first."""
+    if not os.path.exists(db_path):
+        init_db_quiet(db_path)
+    replay_journal(db_path)
+    if not (query or "").strip():
+        return ""
+    with writer_lock(db_path):  # search bumps access stats: one writer at a time
+        return _pre_turn_search(db_path, query, budget, prefer_source, limit, chars)
+
+
+def _pre_turn_search(db_path, query, budget, prefer_source, limit, chars):
+    db = connect(db_path)
+    lines, ids = [], []
+    if prefer_source:
+        l1, i1 = search_lines(db, query, 2, chars, budget * 2 // 5, prefer_source)
+        lines, ids = l1, i1
+    used = sum(len(x) // 4 + 1 for x in lines)
+    l2, _ = search_lines(db, query, max(0, limit - len(lines)), chars,
+                         max(1, budget - used), "", skip_ids=tuple(ids))
+    db.close()
+    return "\n".join(lines + l2)
+
+
+def post_turn(db_path, turns, upkeep=True):
+    """End of turn. `turns` is a list of dicts: speaker (user|agent|tool),
+    text, and optionally session, turn, source, provenance, salience,
+    supersedes, supersession_key, parent_ids, protected, quote, id.
+    Journals first (fsync), applies idempotently, then one upkeep step.
+    Returns the stored ids (retries of the same turn return the same id)."""
+    if not os.path.exists(db_path):
+        init_db_quiet(db_path)
+    replay_journal(db_path)  # finish anything a previous kill left
+    recs, ids = [], []
+    for t in turns:
+        if (t.get("text") or "").strip() == "":
+            continue
+        jid = t.get("id") or turn_id(t)
+        rec = {k: v for k, v in t.items() if k != "id"}
+        rec.update({"jid": jid, "at": t.get("at") or now_iso()})
+        recs.append(rec)
+        ids.append(jid)
+    if recs:
+        _journal_append(db_path, recs)
+    _crash("after_journal")
+    replay_journal(db_path)
+    if upkeep and AUTO:
+        upkeep_step(db_path)
+    return ids
+
+
+def init_db_quiet(db_path):
+    with contextlib.redirect_stdout(io.StringIO()):
+        init_db(db_path)
+
+
+def cmd_pre_turn(args):
+    out = pre_turn(args.db, args.query, args.budget, args.prefer_source,
+                   args.limit, args.chars)
+    print(out or ("(no matches)" if args.query.strip() else ""))
+    return 0
+
+
+def cmd_post_turn(args):
+    turns = []
+    if args.jsonl:
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                turns.append(json.loads(line))
+    elif args.text:
+        t = {"speaker": args.speaker, "text": args.text}
+        for k in ("session", "turn", "source", "provenance", "salience",
+                  "supersedes", "supersession_key", "parent_ids", "quote"):
+            v = getattr(args, k, None)
+            if v not in (None, ""):
+                t[k] = v
+        if args.protected:
+            t["protected"] = True
+        turns.append(t)
+    for t in turns:
+        if t.get("speaker") == "agent" and t.get("provenance") not in (
+                None, "", "agent-said", "agent-inferred"):
+            print(f"REFUSED: speaker=agent cannot claim provenance={t['provenance']}",
+                  file=sys.stderr)
+            return 2
+    ids = post_turn(args.db, turns, upkeep=not args.no_upkeep)
+    print(f"stored {len(ids)}" + (f" last={short(ids[-1])}" if ids else ""))
+    return 0
+
+
+def cmd_upkeep(args):
+    replay_journal(args.db)
+    tot = {}
+    for _ in range(max(1, args.steps)):
+        for k, v in upkeep_step(args.db).items():
+            tot[k] = tot.get(k, 0) + v
+    print(json.dumps(tot))
+    return 0
+
+
+def cmd_upgrade(args):
+    """Migrate an existing install in place: back up, add what v5 needs,
+    switch to WAL, finish any journal. Idempotent; data never moves."""
+    path = args.db
+    if not os.path.exists(path):
+        init_db_quiet(path)
+        print(f"upgrade: no database at {path}; created a fresh v5 one")
+        return 0
+    src = sqlite3.connect(path)
+    try:
+        before = state_get(src, "schema_version", None)
+    except sqlite3.Error:
+        before = None
+    if not args.no_backup and before != 5:
+        bak = f"{path}.pre-v5-{datetime.datetime.now():%Y%m%d-%H%M%S}.bak"
+        dst = sqlite3.connect(bak)
+        src.backup(dst)
+        dst.close()
+        print(f"backup: {bak}")
+    src.close()
+    db = connect(path)
+    db.executescript(SCHEMA)
+    migrate(db)
+    mode = db.execute("PRAGMA journal_mode").fetchone()[0]
+    state_set(db, "schema_version", 5)
+    if before != 5:
+        state_set(db, "upgraded", {"from": before or "4.x", "at": now_iso()})
+    n = db.execute("SELECT COUNT(*) FROM memory_item").fetchone()[0]
+    db.commit()
+    ok = db.execute("PRAGMA integrity_check").fetchone()[0]
+    db.close()
+    lock = path + ".sleep.lock"
+    if lock_status(lock)[0] == "stale":
+        os.remove(lock)
+        print("removed stale sleep lock")
+    done = replay_journal(path)
+    print(f"upgrade: {path} rows={n} journal_mode={mode} integrity={ok} "
+          f"replayed={done} schema=5")
+    return 0 if ok == "ok" else 1
 
 
 def cmd_bench(args):
@@ -1556,7 +2048,8 @@ def cmd_health(args):
         "quarantined": q("SELECT COUNT(*) FROM memory_item WHERE "
                          "status='rejected' AND json_extract(metadata,'$.tombstone_reason') "
                          "LIKE 'gc score%'"),
-        "distills_since_sweep": state_get(db, "distills_since_sweep", 0),
+        "upkeep_last": state_get(db, "upkeep_last", {}),
+        "journal_pending": len(_journal_read(args.db)[0]),
         "possible_conflicts": q("SELECT COUNT(*) FROM memory_item WHERE project=? "
                                 "AND status != 'rejected' AND superseded_by IS NULL "
                                 "AND json_extract(metadata,'$.possible_conflict_with') "
@@ -1576,7 +2069,9 @@ def cmd_health(args):
     if state == "held" and info.get("age_s", 0) > LOCK_TIMEOUT / 2:
         problems.append("lock held a long time")
     if backlog > SETTLE_TURNS * 4:
-        problems.append("settled turns piling up: is auto-sleep running?")
+        problems.append("settled turns piling up: is post-turn being called?")
+    if report["journal_pending"]:
+        problems.append("journaled turns not applied: the next pre/post-turn finishes them")
     if reuse:
         problems.append("entries written but turns not wiped: run sleep --apply")
     if db_ids - seen:
@@ -1593,7 +2088,8 @@ def cmd_health(args):
 
 
 def cmd_end_session(args):
-    """Close a session: its turns become settled and are distilled now."""
+    """Optional since v5: nothing depends on it. Closing a session only lets
+    its turns settle before the age/turn-count rules would."""
     db = connect(args.db)
     ended = state_get(db, "ended_sessions", [])
     if args.session not in ended:
@@ -1699,11 +2195,18 @@ def _sleep(args):
             (SEMANTIC_PROJECT, SETTLE_TURNS)).fetchall()]
         floor = stamps[-1] if len(stamps) >= SETTLE_TURNS else None
         ended = set(state_get(db, "ended_sessions", []))
+        # v5: a turn also settles by age, so a session that never gets an
+        # end-session call (crash, offline, forgotten) still drains.
+        aged = (nowdt - datetime.timedelta(hours=SETTLE_HOURS)).isoformat()
         turns = [t for t in turns
                  if (t["session_key"] and t["session_key"] in ended)
-                 or (floor is not None and t["learned_at"] < floor)]
+                 or (floor is not None and t["learned_at"] < floor)
+                 or t["learned_at"] < aged]
     distilled = wiped = skipped = reused = errors = 0
+    limit = getattr(args, "limit", 0) or 0
     for t in turns:
+        if limit and distilled + reused >= limit:
+            break  # bounded: the rest waits for the next turn's upkeep
         md = json.loads(t["metadata"] or "{}")
         if (t["salience"] < args.min_salience and not md.get("protected")
                 and md.get("hits", 0) < SLEEP_MIN_HITS):
@@ -2337,7 +2840,7 @@ def main():
     p.set_defaults(fn=cmd_reindex)
 
     p = sub.add_parser("sleep",
-                       help="nightly distill: collect, distill, verify, wipe, sweep")
+                       help="manual catch-up distill (v5 does this a slice per turn; never required)")
     p.add_argument("--apply", action="store_true", help="default is a dry run")
     p.add_argument("--min-age-hours", type=float, default=0.0,
                    help="only consume turns at least this old")
@@ -2359,7 +2862,42 @@ def main():
     p.add_argument("--pretty", action="store_true", help="every field, indented")
     p.set_defaults(fn=cmd_health)
 
-    p = sub.add_parser("end-session")
+    p = sub.add_parser("pre-turn", help="start of turn: repair, then recall within a budget")
+    p.add_argument("--query", default="")
+    p.add_argument("--budget", type=int, default=250)
+    p.add_argument("--prefer-source", default="",
+                   help="reserve up to 2 slots for this speaker (e.g. the user)")
+    p.add_argument("--limit", type=int, default=6)
+    p.add_argument("--chars", type=int, default=220)
+    p.set_defaults(fn=cmd_pre_turn)
+
+    p = sub.add_parser("post-turn", help="end of turn: journal, store, one upkeep step")
+    p.add_argument("--jsonl", action="store_true",
+                   help="read turns as JSON lines on stdin (batch; one model load)")
+    p.add_argument("--speaker", default="user", choices=list(SPEAKER_PROVENANCE))
+    p.add_argument("--text", default="")
+    p.add_argument("--session", default="")
+    p.add_argument("--turn", default="")
+    p.add_argument("--source", default="")
+    p.add_argument("--provenance", choices=list(PROVENANCE))
+    p.add_argument("--salience", type=int)
+    p.add_argument("--supersedes", default="")
+    p.add_argument("--supersession-key", default="")
+    p.add_argument("--parent-ids", default="")
+    p.add_argument("--quote", default="")
+    p.add_argument("--protected", action="store_true")
+    p.add_argument("--no-upkeep", action="store_true")
+    p.set_defaults(fn=cmd_post_turn)
+
+    p = sub.add_parser("upkeep", help="run N bounded upkeep steps now (never required)")
+    p.add_argument("--steps", type=int, default=1)
+    p.set_defaults(fn=cmd_upkeep)
+
+    p = sub.add_parser("upgrade", help="migrate an existing DB in place (backs up first)")
+    p.add_argument("--no-backup", action="store_true")
+    p.set_defaults(fn=cmd_upgrade)
+
+    p = sub.add_parser("end-session", help="optional: let a session's turns settle now")
     p.add_argument("--session", required=True)
     p.set_defaults(fn=cmd_end_session)
 
@@ -2407,7 +2945,8 @@ def main():
     p.set_defaults(fn=lambda a: print(VERSION) or 0)
 
     args = ap.parse_args()
-    if args.cmd not in ("init", "reindex", "doctor", "version") and not os.path.exists(args.db):
+    if args.cmd not in ("init", "reindex", "doctor", "version", "upgrade",
+                        "pre-turn", "post-turn") and not os.path.exists(args.db):
         print(f"no database at {args.db} — run `init` first", file=sys.stderr)
         return 1
     if not _REPLAYING and os.path.exists(args.db):
@@ -2416,9 +2955,13 @@ def main():
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
-    return args.fn(args)
+    if args.cmd in READ_ONLY_CMDS or args.cmd in ("init", "pre-turn", "post-turn", "upkeep"):
+        return args.fn(args)  # read-only, or locks its own write sections
+    with writer_lock(args.db):
+        return args.fn(args)
 
 
+READ_ONLY_CMDS = ("get", "health", "bench", "doctor", "version", "correlate")
 SHORT_ID = int(os.environ.get("MEMORYKIT_SHORT_ID", "10"))
 
 

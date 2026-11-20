@@ -1,34 +1,38 @@
 # Changelog
 
-## v4.5.1
-- `INTEGRATE.md` adds a 3-hook contract for any agent: pre-turn search, post-turn capture, end-session.
-- Test fix for dynamic aging.
+## 5.0.0 (2026-11-19)
 
-## v4.5
-- Schema is embedded, so installs no longer need `schema.sql` next to the script.
-- `install.sh` and `uninstall.sh` check dependencies; `doctor` checks health.
-- Persistent model cache via `MEMORYKIT_MODEL_DIR`.
-- Graph ops: weighted `relate`, node `weigh`, `merge`, and quarantine by degree.
-- Additive DB migration for edge weights.
+The end-of-day maintenance is gone. Everything happens per turn.
 
-## v4.3 – v4.4
-- Attribution with `--source` and `--quote`.
-- Scale caches: search over 20k memories went from 9.7 s to 0.7 s.
-- Held-out benchmark of 30 pairs: R@5 rose from 0.30 to 0.77.
+### Added
+- `pre-turn` / `post-turn` hooks (CLI) and `pre_turn()` / `post_turn()` (Python):
+  the whole integration is two calls.
+- Write-ahead capture journal (`<db>.journal.jsonl`, fsynced). Any call replays
+  unfinished turns, so a crash at any point loses nothing and duplicates nothing.
+- Deterministic turn ids: retrying a turn is a no-op.
+- Bounded upkeep slice on every `post-turn`: distill at most 2 settled turns,
+  GC-score 25 rows and dedup-check 8 rows from rolling cursors. Tunable with
+  `MEMORYKIT_UPKEEP_DISTILL`, `MEMORYKIT_UPKEEP_GC_ROWS`, `MEMORYKIT_UPKEEP_DEDUP_ROWS`.
+- Turns settle by age (`MEMORYKIT_SETTLE_HOURS`, default 6) as well as by count,
+  so a session nobody closes still drains.
+- `upgrade`: in-place migration from 4.x with an automatic backup; idempotent.
+- `upkeep`: run slices by hand (never required).
+- `--prefer-source` lane in recall (two reserved slots for the user's own words).
+- `adapters/`: generic shell hooks, a chat-journal batch adapter, notes for a
+  second agent.
+- SQLite WAL mode with `synchronous=FULL`.
+- `health` reports `journal_pending` and `upkeep_last`.
+- `test_v5.py`: real SIGKILL-style crash tests and missed-session tests.
 
-## v4 – v4.2
-- Hybrid cosine + BM25 ranking, with salience as a tilt rather than a multiplier.
-- Token-lean output, short ids, and `get --text`.
-- Use-earned distillation, a novelty fix for changed values, conflict flags, and a `bench` command.
+### Changed
+- `capture` runs one bounded upkeep slice instead of the old auto-sleep plus a
+  full gc + dedup sweep every 50 distills.
+- `capture` with a forced id is idempotent (also makes `reindex` replays safe).
+- `end-session` and `sleep` are optional manual tools; nothing depends on them.
 
-## v3 – v3.3
-- Sleep triggered by function rather than clock: settle after 8 newer turns or at end-session, and sweep every 50 distills.
-- Distiller output is stripped of forged provenance headers.
-- Stale-lock recovery, NFKC header stripping, and a `health` command.
+### Removed
+- `MEMORYKIT_SWEEP_EVERY` and the `distills_since_sweep` counter.
 
-## v2 – v2.1
-- Reindex from the markdown log, plus `feedback`, `promote`, a salience regex and scalable dedup.
-- `restore` restarts decay; `rebuild` keeps quarantine times.
-
-## v1.1
-- Patched the original kit: 6 bug fixes.
+## 4.5.0
+Embedded schema, installer, `doctor`, graph operations (`relate`, `weigh`,
+`merge`, `quarantine` by degree).

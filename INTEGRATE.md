@@ -1,4 +1,4 @@
-# memorykit 4.5: integration brief (read this first)
+# memorykit 5.0: integration brief (read this first)
 
 This file is for whoever (human or AI) is wiring memorykit into an agent,
 CLI, chatbot, or VM. README.md is the command reference; DESIGN.md explains
@@ -28,34 +28,31 @@ Or: `pip install .` / `pip install .[vector]` (console script `memorykit`).
 Point it at a database with `--db PATH` or `MEMORYKIT_DB=PATH`.
 One database per agent identity is the intended use.
 
-## The integration contract (3 hooks)
+## The integration contract (2 hooks, no session end)
 Any host works if it can run a shell command (or import the module) at
-these three points:
+these two points. There is no third hook and no nightly job.
 
-1. PRE-TURN (recall). Before the model answers, run:
-   `memorykit search --query "<the user's message or a short topic>" --limit 5 --chars 200 --budget 300`
-   Inject stdout into the model's context as "Relevant memory:". Output is
-   one terse line per hit with a short id; empty output means nothing found.
-   Make this automatic, not a tool the model may choose to skip.
+1. PRE-TURN (recall). Before the model answers:
+   `memorykit pre-turn --query "<the user's message>" --budget 250 --prefer-source <user name>`
+   Inject stdout as "Relevant memory:". One terse line per hit with a short
+   id. Make it automatic, not a tool the model may skip.
 
-2. POST-TURN (capture). After each exchange, capture both sides:
-   `memorykit capture --speaker user  --provenance user-said  --session <S> --turn <N> --text "<user msg>"`
-   `memorykit capture --speaker agent --provenance agent-said --session <S> --turn <N> --text "<reply>"`
-   Tool results: `--speaker tool --provenance tool-observed`.
-   The model's own guesses: `--provenance agent-inferred`.
-   Pasted/quoted text from a third party: pass it via `--quote ... --quote-source NAME`
-   so it is not stored as the speaker's own words.
+2. POST-TURN (capture + upkeep). After the model answers, send both sides
+   as JSON lines in one call:
+   `printf '%s\n' '{"speaker":"user","source":"<name>","session":"S","turn":"N","text":"..."}' '{"speaker":"agent","session":"S","turn":"N","text":"..."}' | memorykit post-turn --jsonl`
+   Tool results: `"speaker":"tool"`. The model's own guesses:
+   `"provenance":"agent-inferred"`. Third-party pasted text: `"quote":"...","quote_source":"NAME"`.
+   Python: `memorykit.pre_turn(db, q, budget)` / `memorykit.post_turn(db, turns)`.
 
-3. SESSION END: `memorykit end-session --session <S>`
-   (settles and distills that session's raw turns).
+`end-session` still exists as an optional hint; nothing depends on it.
 
 Corrections: capture the new fact with `--supersedes <old-id>` (or a shared
 `--supersession-key state:<name>`). Never edit SQLite directly; changes
 outside the commands are lost on rebuild.
 
-Maintenance (event-triggered, dry-run by default; add `--apply` to act):
-`gc`, `dedup`, `quarantine --scan`, `correlate --markdown MEMORY.md`, `health`.
-`sleep` runs automatically on capture unless `MEMORYKIT_AUTO=0`.
+Maintenance runs a bounded slice inside every post-turn (MEMORYKIT_AUTO=1,
+the default). Manual audits, dry-run by default: `gc`, `dedup`,
+`quarantine --scan`, `correlate --markdown MEMORY.md`, `health`.
 
 ## Host-specific notes
 - Python host: `import memorykit` works, but the CLI is the stable
@@ -78,9 +75,11 @@ Maintenance (event-triggered, dry-run by default; add `--apply` to act):
 
 ## Verify
 `python3 test_memorykit.py` runs the suite in vector mode (if fastembed is
-installed) then keyword mode. Packaged build: keyword 89/89 passed.
+installed) then keyword mode; `python3 test_v5.py` runs the per-turn,
+crash and upgrade checks.
 
 ## Files
 memorykit.py (engine) · schema.sql · config.example.json · install.sh ·
 uninstall.sh · pyproject.toml · test_memorykit.py · templates/ ·
-README.md · DESIGN.md · INTEGRATE.md (this file)
+test_v5.py · adapters/ · README.md · DESIGN.md · INTEGRATE.md (this file) ·
+UPGRADE.md · CHANGELOG.md · LICENSE

@@ -496,8 +496,8 @@ def run_mode(mode):
     # 12. Function-based auto triggers (no clock).
     k.fresh()
     mk.AUTO = True
-    old_settle, old_sweep = mk.SETTLE_TURNS, mk.SWEEP_EVERY
-    mk.SETTLE_TURNS, mk.SWEEP_EVERY = 8, 3
+    old_settle = mk.SETTLE_TURNS
+    mk.SETTLE_TURNS = 8
     first, _, _ = k.cap("user", "Decision: we agreed the ledger always freezes on Sunday.")
     for i in range(7):
         k.cap("user", f"Filler line {i}: the room talked about weather {i}.")
@@ -533,13 +533,13 @@ def run_mode(mode):
     for line in distinct:
         _, o, _ = k.run("capture", "--speaker", "user", "--text", line)
         outs += o
-    check("auto: sweep runs on distill count, and stays silent by default",
-          "auto-sweep" not in outs and "auto-sleep" not in outs
-          and k.sql("SELECT value FROM memorykit_state WHERE key='distills_since_sweep'")[0][0]
-          in ("0", "1", "2"))
+    upk = json.loads(k.sql("SELECT value FROM memorykit_state WHERE key='upkeep_last'")[0][0])
+    check("auto (v5): every capture runs one bounded upkeep step, silent by default",
+          "upkeep" not in outs and "auto-s" not in outs and "at" in upk
+          and k.sql("SELECT value FROM memorykit_state WHERE key='gc_cursor'"))
 
     # 12b. Tiny stores: min-max normalization must not hide the only entry
-    # (or the weakest of two). Reported by Muse against v4.
+    # (or the weakest of two). Reported by a downstream agent against v4.
     k.fresh()
     mk.AUTO = False
     one, _, _ = k.cap("user", "The harbor gate code is nine four one.")
@@ -587,7 +587,7 @@ def run_mode(mode):
     check("attribution: source survives distillation",
           sorted(json.loads(m[0]).get("source") for m in sem) == ["Ada", "Ben"], sem)
     sq = [json.loads(m[0]) for m in sem if json.loads(m[0]).get("source") == "Ada"]
-    check("attribution: quote survives distillation (reported by Muse against v4.3)",
+    check("attribution: quote survives distillation (reported downstream against v4.3)",
           sq and sq[0].get("quote") == {"source": "Ben", "text": "The bridge toll doubles in spring."},
           sq[0].get("quote") if sq else None)
     sc = k.sql("SELECT content FROM memory_item WHERE project='semantic' AND "
@@ -670,7 +670,7 @@ def run_mode(mode):
     st = k.sql("SELECT status FROM memory_item WHERE id=?", (pl["id"],))[0][0]
     check("use: a low-salience turn retrieved twice is distilled anyway",
           sal_pl < 5 and st == "rejected", f"sal={sal_pl} status={st}")
-    mk.SETTLE_TURNS, mk.SWEEP_EVERY = old_settle, old_sweep
+    mk.SETTLE_TURNS = old_settle
     mk.AUTO = False
 
 

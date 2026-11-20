@@ -234,7 +234,7 @@ templated entries into one blob.
 Merges keep the highest-provenance entry and supersede the rest.
 Dedup is reversible tombstoning, never deletion.
 
-## Garbage collection (the nightly tidy)
+## Garbage collection (amortized, one slice per turn)
 
 The store is self-healing, not append-only. Every GC pass scores each
 live entry:
@@ -274,10 +274,13 @@ timer; the triggers are events:
 - **Settled by distance:** a turn has left the working window once
   `MEMORYKIT_SETTLE_TURNS` (default 8) newer raw turns exist. A quick
   follow-up correction is no longer likely, so it's safe to distill.
-- **Settled by closure:** `end-session --session S` settles every turn
-  in that session at once.
-- **Sweep by volume:** gc + dedup run after every
-  `MEMORYKIT_SWEEP_EVERY` (default 50) distills.
+- **Settled by closure (optional):** `end-session --session S` settles
+  every turn in that session at once. Nothing depends on it.
+- **Settled by age (v5):** a turn older than `MEMORYKIT_SETTLE_HOURS`
+  (default 6) is settled even if no newer turns and no session close
+  ever arrive.
+- **Sweep (v5):** there is no batch sweep any more; see "Per-turn
+  upkeep" below.
 
 With `MEMORYKIT_AUTO=1` (default) every capture checks for settled turns
 and distills only those, so with the default verbatim distiller the
@@ -315,6 +318,45 @@ Order, every time: **collect → distill → verify → wipe → sweep.**
   for itself: the settled backlog, entries written but not yet wiped,
   lock state, and rows that are in the DB but not the log (those would
   be lost on reindex).
+
+## Per-turn upkeep (v5): no end-of-day pass
+
+4.x ran its maintenance in batches: `sleep` at session end, a full gc +
+dedup sweep every 50 distills, and whatever cron the host added. Each of
+those depends on a call that may never come (a crash, a dropped
+connection, an agent that just stops). v5 makes every piece incremental
+and bounded, and hangs it on the two calls an agent makes every turn.
+
+- **pre_turn** replays the journal, then searches. It writes only access
+  stats, so it stays fast at the start of a turn.
+- **post_turn** appends the turns to `<db>.journal.jsonl` and fsyncs
+  *before* touching the database, applies them (each in one SQLite
+  transaction, ids derived from session/turn/speaker/text so a retry is a
+  no-op), writes the markdown log from the stored row, marks each journal
+  record done, and then runs one upkeep slice.
+- **The upkeep slice:** distill at most `MEMORYKIT_UPKEEP_DISTILL` (2)
+  settled turns; GC-score the next `MEMORYKIT_UPKEEP_GC_ROWS` (25) live
+  rows from a rolling rowid cursor; dedup-check the next
+  `MEMORYKIT_UPKEEP_DEDUP_ROWS` (8) rows against the live set. Cursors
+  live in the state table and wrap, so the whole store is visited every
+  ~N/25 turns. Each part commits on its own and is wrapped so a failing
+  part never fails the turn.
+- **Decay is lazy:** `gc_score` already computes decay from `learned_at`
+  at the moment a row is scored, so a month offline needs no catch-up;
+  the next slice simply sees older timestamps.
+
+Crash windows, and what closes each one:
+
+| Killed... | State left | Repaired by |
+|---|---|---|
+| before the journal line is complete | torn line | ignored on read (never acknowledged) |
+| after the journal, before the DB commit | journal record, no row | next pre/post-turn stores it |
+| after the DB commit, before the log | row, no log line | next call rebuilds the log line from the row |
+| mid-distill | entry written, turn not wiped | the 4.x reuse path (edge lookup) |
+| mid-GC / mid-dedup slice | nothing (one transaction) | the cursor simply repeats the window |
+
+SQLite runs in WAL mode with `synchronous=FULL`, so a committed turn
+survives power loss and readers never block the writer.
 
 ## Cross-layer audit (correlate)
 
