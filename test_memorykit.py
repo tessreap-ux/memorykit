@@ -172,8 +172,9 @@ def run_mode(mode):
     k.fresh()
     a, _, _ = k.cap("agent", "twin note alpha about the shelf price test", "--salience", "5")
     b, _, _ = k.cap("agent", "twin note beta about the shelf price test", "--salience", "5")
-    k.sql("UPDATE memory_item SET learned_at='2026-08-20T00:00:00+00:00', "
-          "last_accessed_at='2026-08-20T00:00:00+00:00'")
+    _aged = (__import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+             - __import__("datetime").timedelta(days=69)).isoformat()
+    k.sql("UPDATE memory_item SET learned_at=?, last_accessed_at=?", (_aged, _aged))
     for _ in range(3):
         k.run("feedback", "--id", a["id"], "--rating", "-1")
     _, out, _ = k.run("gc")

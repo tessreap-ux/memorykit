@@ -348,6 +348,62 @@ python3 memorykit.py reindex
 The database is an index, not an archive. If it disagrees with the
 markdown, the markdown wins.
 
+## Graph operations and quarantine by degree (v4.5)
+
+Entries are nodes and `memory_edge` rows are edges. A node's weight is its
+salience (1-10). An edge's weight is `memory_edge.weight` (default 1.0;
+older databases gain the column on first connect, an additive migration).
+
+* **System edges vs. relations.** `derived_from` and `distilled_from` are
+  written only by the engine. They carry causal lineage, so cascade pruning
+  and restore follow them. `relate` writes every other predicate
+  (`supports`, `contradicts`, `related`, ...) and refuses the system ones, so
+  a user or agent can never forge lineage. Re-relating a pair updates the
+  weight, and weight 0 removes the edge.
+* **weigh** sets salience directly or by a delta, clamped to 1-10, and marks
+  `salience_reason: manual`. It is a judgment, so it is logged like one.
+* **merge** is the explicit form of dedup: each dropped entry is superseded
+  by the kept one and soft-deleted. Its relation edges move to the kept
+  entry, and its id, source and provenance are appended to the kept entry's
+  `merged_from`. Nothing is deleted, and `gc --restore` brings a drop back.
+* **Quarantine by degrees of separation.** `quarantine --id X --degrees N`
+  walks edges in both directions (weight > 0), plus `possible_conflict_with`
+  links, out to N hops, and quarantines everything it reaches. It is a dry
+  run unless `--apply` is given. Exempt neighbors (salience >= 9 or protected)
+  are listed as held, never pulled down: the same rule cascade pruning
+  follows. The root itself can be quarantined even when exempt, because
+  naming it is an explicit decision. Every row carries `quarantine via ROOT
+  hop K`, so `quarantine --restore ROOT` reverses the whole sweep.
+* **scan** lists candidate pairs and acts on none: conflicts (recorded
+  flags), duplicates (the dedup gates), and overlap (cosine >=
+  `MEMORYKIT_OVERLAP_COS`, default 0.92, below the duplicate bar).
+
+Every one of these ops (`relate`, `weigh`, `merge`, `quarantine`, `restore`)
+is written to the markdown log, and `reindex` replays them, so the graph is
+as disposable as the rest of the index.
+
+## Packaging (v4.5)
+
+The schema is embedded in `memorykit.py` (`SCHEMA`). `schema.sql` remains
+as documentation, and a test keeps the two byte-identical. A lone copy of the
+file therefore works from any path. That was the v4.4 failure, when init
+looked for `schema.sql` beside the executable in `/usr/local/bin`.
+`install.sh` checks for Python >= 3.9, sqlite3 and venv and offers to
+install what is missing. It builds a venv that reuses system
+fastembed/numpy, writes a wrapper, and runs `doctor`. The model cache is
+pinned to `MEMORYKIT_MODEL_DIR`, because fastembed's default is under
+`/tmp`: tmpfs wipes it on reboot, and search would then silently drop to
+keyword mode.
+
+## Retrieval: what was tried in v4.5 and not shipped
+
+Four variants were scored on heldout / arc_queries / arc_paraphrase:
+chunk max-sim, chunk boost, header-stripped vectors, and the bge query
+instruction. None beat v4.4 on all three sets. Each gained on exact-wording
+queries and lost on paraphrase. Ranking is unchanged. The remaining misses
+are single sentences buried in long, multi-topic chat posts. That is better
+fixed at ingest, by splitting posts, than in ranking.
+
 ## What this design deliberately does NOT do
 
 - No sync, no account, no key, no server. Local-only by default.
