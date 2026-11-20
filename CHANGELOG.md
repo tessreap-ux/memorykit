@@ -1,5 +1,17 @@
 # Changelog
 
+## 5.0.1 (2026-11-20)
+
+### Added
+- `memorykit repair --drift [--apply]`: heals drift between the DB and the markdown
+  log without dropping anything. Dry run by default. With `--apply` it backs the DB up
+  (`<db>.pre-repair-<ts>.bak`), writes DB-only rows (and their provenance) into the log,
+  replays log-only captures into the DB, and re-applies the supersede, quarantine and
+  relate records that touch them. Idempotent; a second run reports nothing to repair.
+  Edges and weights on existing nodes are never rewritten. (Reported from a live store that had
+  300 log-only entries and 1 DB-only row; a plain `reindex` would have lost it.)
+- `test_repair.py`.
+
 ## 5.0.0 (2026-11-19)
 
 The end-of-day maintenance is gone. Everything happens per turn.

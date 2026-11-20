@@ -71,7 +71,7 @@ MODEL = os.environ.get("MEMORYKIT_MODEL", "BAAI/bge-small-en-v1.5")
 MODEL_DIR = os.environ.get("MEMORYKIT_MODEL_DIR") or os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
     "memorykit", "models")
-VERSION = "5.0.0"
+VERSION = "5.0.1"
 
 # Provenance -> (entry type, default confidence). Agent-originated content
 # is NEVER stored as fact: only user statements and tool observations earn
@@ -2440,6 +2440,106 @@ def cmd_reindex(args):
     return 0
 
 
+def _read_log_records(d):
+    recs = []
+    files = sorted(f for f in os.listdir(d) if f.endswith(".md")) if os.path.isdir(d) else []
+    for f in files:
+        for n, line in enumerate(open(os.path.join(d, f), encoding="utf-8")):
+            m = MK_RE.search(line)
+            if m:
+                try:
+                    recs.append((json.loads(m.group(1)), f, n))
+                except json.JSONDecodeError:
+                    pass
+    recs.sort(key=lambda x: (x[0].get("at", ""), x[1], x[2]))
+    return recs
+
+
+def cmd_repair(args):
+    """Heal drift between the DB and the markdown log without losing either side.
+
+    Dry run unless --apply. Order: back up the DB, write DB-only rows into the
+    log, replay log-only captures into the DB (plus the supersede, quarantine,
+    relate and weigh records that touch them). Nothing is dropped; running it
+    twice changes nothing the second time."""
+    global _REPLAYING
+    d = args.md_dir or md_dir_for(args.db)
+    recs = _read_log_records(d)
+    db = connect(args.db)
+    db_ids = {r[0] for r in db.execute("SELECT id FROM memory_item")}
+    db.close()
+    log_ids = {r["id"] for r, _, _ in recs if r.get("op") == "capture"}
+    missing = [r for r, _, _ in recs if r.get("op") == "capture" and r["id"] not in db_ids]
+    orphans = sorted(db_ids - log_ids)
+    print(f"drift: {len(missing)} log-only capture(s), {len(orphans)} db-only row(s)")
+    if not args.apply:
+        print("dry run: pass --apply to repair (a backup is made first)")
+        return 0
+    if not missing and not orphans:
+        print("nothing to repair")
+        return 0
+    with writer_lock(args.db):
+        bak = f"{args.db}.pre-repair-{int(time.time())}.bak"
+        src = sqlite3.connect(args.db)
+        dst = sqlite3.connect(bak)
+        src.backup(dst)
+        dst.close()
+        src.close()
+        print(f"backup: {bak}")
+        for eid in orphans:  # export first: reindex-style rebuilds would lose these
+            _log_from_row(args.db, eid)
+        new_ids = set()
+        _REPLAYING = True
+        try:
+            for rec in missing:
+                ns = argparse.Namespace(
+                    db=args.db, speaker=rec["speaker"], text=rec["text"],
+                    session=rec.get("session", ""), turn=rec.get("turn", ""),
+                    provenance=rec["provenance"], salience=rec["salience"],
+                    supersedes=",".join(rec.get("supersedes", [])),
+                    supersession_key="", parent_ids=",".join(rec.get("parents", [])),
+                    check=False, project=rec.get("project", "turns"),
+                    protected=rec.get("protected", False), source=rec.get("source", ""),
+                    quote=(rec.get("quote") or {}).get("text", ""),
+                    quote_source=(rec.get("quote") or {}).get("source", ""),
+                    no_auto=True, no_log=True, force_id=rec["id"], force_at=rec["at"])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        cmd_capture(ns)
+                    except sqlite3.IntegrityError:
+                        continue
+                db = connect(args.db)
+                row = db.execute("SELECT metadata FROM memory_item WHERE id=?", (rec["id"],)).fetchone()
+                if row:
+                    md = json.loads(row[0] or "{}")
+                    if rec.get("supersession_key"):
+                        md["supersession_key"] = rec["supersession_key"]
+                    md["salience_reason"] = "manual" if rec.get("salience_manual") else "heuristic"
+                    md["repaired"] = True
+                    db.execute("UPDATE memory_item SET metadata=? WHERE id=?", (json.dumps(md), rec["id"]))
+                    db.commit()
+                    new_ids.add(rec["id"])
+                db.close()
+            for rec, _, _ in recs:
+                op = rec.get("op")
+                db = connect(args.db)
+                try:
+                    if op == "supersede" and (rec["old"] in new_ids or rec["new"] in new_ids):
+                        db.execute("UPDATE memory_item SET superseded_by=? WHERE id=?", (rec["new"], rec["old"]))
+                        tombstone(db, rec["old"], f"superseded by {rec['new']}", at=rec.get("at"))
+                    elif op == "quarantine" and rec["id"] in new_ids:
+                        tombstone(db, rec["id"], rec.get("reason", "quarantine"), at=rec.get("at"))
+                    elif op == "relate" and (rec["a"] in new_ids or rec["b"] in new_ids):
+                        relate(db, rec["a"], rec["b"], rec["predicate"], rec["weight"], rec["at"])
+                    db.commit()
+                except (ValueError, KeyError, sqlite3.Error) as e:
+                    print(f"repair: skipped {op}: {e}", file=sys.stderr)
+                db.close()
+        finally:
+            _REPLAYING = False
+    print(f"repaired: restored {len(new_ids)} node(s), logged {len(orphans)} orphan(s)")
+    return 0
+
 
 # ---------------------------------------------------------------- graph ops
 #
@@ -2838,6 +2938,12 @@ def main():
     p.add_argument("--md-dir", default="")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_reindex)
+
+    p = sub.add_parser("repair", help="heal DB/log drift without dropping rows (dry run by default)")
+    p.add_argument("--drift", action="store_true", help="(default and only mode)")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--md-dir", default="")
+    p.set_defaults(fn=cmd_repair)
 
     p = sub.add_parser("sleep",
                        help="manual catch-up distill (v5 does this a slice per turn; never required)")

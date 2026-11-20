@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memorykit"
-version = "5.0.0"
+version = "5.0.1"
 description = "Plug-and-play vector-memory map for agents: markdown source of truth, SQLite index, provenance firewall."
 readme = "README.md"
 requires-python = ">=3.9"
