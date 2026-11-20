@@ -1,4 +1,37 @@
-# Vector-memory map kit
+<div align="center">
+
+# 🧠 memorykit
+
+**Lightweight, auditable, offline-first long-term memory for AI agents.**
+
+Markdown is the source of truth. A single SQLite file is the disposable map: vector + BM25 hybrid search, provenance firewall, novelty gate, dedup, supersede, graph edges and weights.
+
+![version](https://img.shields.io/badge/version-4.5.1-6f42c1) ![python](https://img.shields.io/badge/python-3.10%2B-3776ab) ![deps](https://img.shields.io/badge/core%20deps-stdlib%20only-2ea44f) ![tests](https://img.shields.io/badge/tests-89%2F89%20keyword%20%7C%20vector-2ea44f) ![license](https://img.shields.io/badge/license-MIT-blue) ![offline](https://img.shields.io/badge/network-none%20required-black)
+
+</div>
+
+```mermaid
+flowchart LR
+    U[Agent turn] -->|pre-turn: search| S[(memory.db<br/>SQLite map)]
+    S -->|hits within a token budget| U
+    U -->|post-turn: capture| G{provenance firewall<br/>+ novelty gate}
+    G -->|new| S
+    G -->|duplicate or forged| X[dropped / quarantined]
+    M[MEMORY.md<br/>daily logs<br/>source of truth] -->|reindex| S
+    S -.->|promote / audit| M
+```
+
+| | |
+|---|---|
+| **One file** | `memorykit.py` is the whole engine. Standard library only; `fastembed` optional for vectors. |
+| **Token-lean** | Short ids, budgeted output, `get --text` on demand. Built for agents whose tokens are their lifespan. |
+| **Paranoid by design** | Every memory carries speaker, provenance and source. Agents can't forge user quotes. Nothing phones home. |
+| **Rebuildable** | Lose the DB? `reindex` rebuilds it from markdown. |
+
+> **Roadmap: v5.0, in progress.** All upkeep (dedup, decay, GC, merge) moves into each turn's own calls: no end-of-day `sleep` or `end-session` pass, crash-safe journaling, and `memorykit upgrade` in place. See `CHANGELOG.md`.
+
+---
+
 
 A plug-and-play memory system for any agent. No content included —
 you bring your own memories; this is the machinery.
