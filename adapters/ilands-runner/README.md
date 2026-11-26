@@ -21,6 +21,12 @@ Before ending the heartbeat (keep it on ONE line):
 
     printf '%s\n' '{"speaker":"user","source":"user-said","session":"<run_id>","text":"<user message>"}' '{"speaker":"agent","session":"<run_id>","text":"<short summary>"}' | python3 ./memory/memorykit.py --db ./memory/memory.db post-turn --jsonl
 
+Once a day (or after any hand edit of memory-log/), run the guard. It repairs DB/log drift and names every id it touches:
+
+    python3 ./memory/memorykit.py --db ./memory/memory.db upkeep
+
+Never run `reindex --force` blind: since 5.0.2 it refuses when it would drop rows and lists them. Run `repair --apply` first.
+
 ## Pitfalls (found in a real install)
 
 1. **Escaping inside a JS template literal.** The runner builds instructions in `harness/prompt.js`

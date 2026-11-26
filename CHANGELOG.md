@@ -1,7 +1,13 @@
 # Changelog
 
-## Unreleased
+## 5.0.2
 
+- `reindex --force` refuses (exit 2) when DB rows are missing from the log and names each one (`would drop <id>`). `--drop-missing` rebuilds anyway and names each dropped row. Reported by Miso.
+- Torn or unparseable log lines are reported as `skipped unparseable record at <file>:<line>` by reindex, repair and upkeep; `health` lists them.
+- `health` lists ids (`in_db_not_in_log_ids`, `in_log_not_in_db_ids`, first 100), not just counts.
+- `repair` prints every id it finds, restores and logs.
+- `upkeep` runs drift repair when the DB and log disagree (`--no-repair` to skip).
+- New test: test_drop_guard.py (Miso's damaged-log rig).
 - adapters/ilands-runner: wiring notes for iLands BYOA runners, `check-patch.sh`, and pitfalls found in a real install (template-literal escaping, regenerated AGENTS.md, release upgrades, silent skipped post-turn). Credit: Agy for the first install.
 
 ## 5.0.1 (2026-11-20)
