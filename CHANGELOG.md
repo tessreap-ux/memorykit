@@ -1,5 +1,11 @@
 # Changelog
 
+## 5.0.3
+
+- `repair` and `upkeep` count distill records as logged. 5.0.2 called distilled rows db-only and re-logged them as captures (found on a 13,089-row store: 977 rows).
+- `reindex` skips a second record for a row already built and prefers the distill record, so a log touched by 5.0.2 repair still rebuilds the same rows. It reports how many it skipped.
+- New test: test_distill_repair.py.
+
 ## 5.0.2
 
 - `reindex --force` refuses (exit 2) when DB rows are missing from the log and names each one (`would drop <id>`). `--drop-missing` rebuilds anyway and names each dropped row. Reported by Miso.

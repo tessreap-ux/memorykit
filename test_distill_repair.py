@@ -17,14 +17,21 @@ def test():
             "--text", f"decision {i}: we ship the orchid build from rack {i} every friday")
     run(db, "end-session", "--session", "s1")
     rc, o = run(db, "sleep", "--apply", "--no-sweep")
+    spec = importlib.util.spec_from_file_location("mk", MK); mk = importlib.util.module_from_spec(spec)
+    os.environ.update(ENV); spec.loader.exec_module(mk)
     sem = rows(db, "where project='semantic'")
-    if not sem:
-        print("distill-repair: SKIP (sleep made no semantic row here)", o[-200:]); return
+    if not sem:  # write one distilled row the way sleep does
+        turns = sorted(rows(db))[:3]; at = mk.now_iso(); eid = "sem0000000000000000000001"
+        c = mk.connect(db)
+        mk.insert_semantic(c, db, eid, at, "we ship the orchid build every friday",
+                           "agent-said", 4, turns, "", False, "", None)
+        c.commit(); c.close()
+        mk.log_md(db, {"op": "distill", "id": eid, "at": at, "text": "we ship the orchid build every friday",
+                       "provenance": "agent-said", "salience": 4, "turns": turns}, "[distill] orchid")
+        sem = {eid}
     rc, o = run(db, "repair")
     assert "0 db-only" in o, o
     # emulate 5.0.2: re-log a distilled row as a capture
-    spec = importlib.util.spec_from_file_location("mk", MK); mk = importlib.util.module_from_spec(spec)
-    os.environ.update(ENV); spec.loader.exec_module(mk)
     for i in sem:
         mk._log_from_row(db, i)
     before = rows(db)
