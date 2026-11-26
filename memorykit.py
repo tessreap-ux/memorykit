@@ -71,7 +71,7 @@ MODEL = os.environ.get("MEMORYKIT_MODEL", "BAAI/bge-small-en-v1.5")
 MODEL_DIR = os.environ.get("MEMORYKIT_MODEL_DIR") or os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
     "memorykit", "models")
-VERSION = "5.0.2"
+VERSION = "5.0.3"
 
 # Provenance -> (entry type, default confidence). Agent-originated content
 # is NEVER stored as fact: only user statements and tool observations earn
@@ -1931,8 +1931,9 @@ def cmd_upkeep(args):
         db = connect(args.db)
         db_ids = {r[0] for r in db.execute("SELECT id FROM memory_item")}
         db.close()
-        log_ids = {r["id"] for r, _, _ in recs if r.get("op") == "capture"}
-        if db_ids - log_ids or log_ids - db_ids:
+        log_ids = _log_capture_ids(recs)
+        if db_ids - log_ids or {r["id"] for r, _, _ in recs
+                                if r.get("op") == "capture"} - db_ids:
             cmd_repair(argparse.Namespace(db=args.db, md_dir="", apply=True, drift=True))
     tot = {}
     for _ in range(max(1, args.steps)):
@@ -2335,9 +2336,18 @@ def cmd_reindex(args):
     init_db(args.db)
     _REPLAYING = True
     counts = {}
+    distilled = {r["id"] for r, _, _ in records if r.get("op") == "distill" and r.get("id")}
+    built, dup = set(), 0
     try:
         for rec, _, _ in records:
             op = rec.get("op")
+            if op in ("capture", "distill"):
+                # 5.0.2 repair could log a distilled row a second time as a
+                # capture; the distill record is the real one.
+                if rec.get("id") in built or (op == "capture" and rec.get("id") in distilled):
+                    dup += 1
+                    continue
+                built.add(rec.get("id"))
             counts[op] = counts.get(op, 0) + 1
             if op == "capture":
                 ns = argparse.Namespace(
@@ -2449,6 +2459,9 @@ def cmd_reindex(args):
         _REPLAYING = False
     print(f"reindexed {len(records)} record(s) from {len(files)} file(s): "
           + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    if dup:
+        print(f"skipped {dup} duplicate record(s) for rows already built "
+              "(e.g. distilled rows re-logged by 5.0.2 repair)")
     return 0
 
 
@@ -2499,7 +2512,7 @@ def cmd_repair(args):
     db = connect(args.db)
     db_ids = {r[0] for r in db.execute("SELECT id FROM memory_item")}
     db.close()
-    log_ids = {r["id"] for r, _, _ in recs if r.get("op") == "capture"}
+    log_ids = _log_capture_ids(recs)  # capture AND distill records both rebuild a row
     missing = [r for r, _, _ in recs if r.get("op") == "capture" and r["id"] not in db_ids]
     orphans = sorted(db_ids - log_ids)
     print(f"drift: {len(missing)} log-only capture(s), {len(orphans)} db-only row(s)")
