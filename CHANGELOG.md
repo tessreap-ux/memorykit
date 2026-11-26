@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- adapters/ilands-runner: wiring notes for iLands BYOA runners, `check-patch.sh`, and pitfalls found in a real install (template-literal escaping, regenerated AGENTS.md, release upgrades, silent skipped post-turn). Credit: Agy for the first install.
+
 ## 5.0.1 (2026-11-20)
 
 ### Added
