@@ -71,7 +71,7 @@ MODEL = os.environ.get("MEMORYKIT_MODEL", "BAAI/bge-small-en-v1.5")
 MODEL_DIR = os.environ.get("MEMORYKIT_MODEL_DIR") or os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
     "memorykit", "models")
-VERSION = "5.0.1"
+VERSION = "5.0.2"
 
 # Provenance -> (entry type, default confidence). Agent-originated content
 # is NEVER stored as fact: only user statements and tool observations earn
@@ -1926,6 +1926,14 @@ def cmd_post_turn(args):
 
 def cmd_upkeep(args):
     replay_journal(args.db)
+    if not getattr(args, "no_repair", False):
+        recs = _read_log_records(md_dir_for(args.db))
+        db = connect(args.db)
+        db_ids = {r[0] for r in db.execute("SELECT id FROM memory_item")}
+        db.close()
+        log_ids = {r["id"] for r, _, _ in recs if r.get("op") == "capture"}
+        if db_ids - log_ids or log_ids - db_ids:
+            cmd_repair(argparse.Namespace(db=args.db, md_dir="", apply=True, drift=True))
     tot = {}
     for _ in range(max(1, args.steps)):
         for k, v in upkeep_step(args.db).items():
@@ -2023,17 +2031,8 @@ def cmd_health(args):
         (SEMANTIC_PROJECT,)).fetchone()[0]
     db_ids = {r[0] for r in db.execute("SELECT id FROM memory_item")}
     rows = len(db_ids)
-    seen = set()
-    d = md_dir_for(args.db)
-    if os.path.isdir(d):
-        for f in sorted(os.listdir(d)):
-            if f.endswith(".md"):
-                for line in open(os.path.join(d, f), encoding="utf-8"):
-                    m = MK_RE.search(line)
-                    if m:
-                        rec = json.loads(m.group(1))
-                        if rec.get("op") in ("capture", "distill") and rec.get("id"):
-                            seen.add(rec["id"])
+    _recs, bad_lines = _scan_log(md_dir_for(args.db), quiet=True)
+    seen = _log_capture_ids(_recs)
     state, info = lock_status(args.db + ".sleep.lock")
     report = {
         "raw_live": raw_live,
@@ -2058,6 +2057,9 @@ def cmd_health(args):
         "log_entries": len(seen),
         "in_db_not_in_log": len(db_ids - seen),
         "in_log_not_in_db": len(seen - db_ids),
+        "in_db_not_in_log_ids": sorted(db_ids - seen)[:100],
+        "in_log_not_in_db_ids": sorted(seen - db_ids)[:100],
+        "unparseable_log_lines": bad_lines[:100],
         "lock": state,
         "lock_info": info,
         "auto": AUTO,
@@ -2075,9 +2077,11 @@ def cmd_health(args):
     if reuse:
         problems.append("entries written but turns not wiped: run sleep --apply")
     if db_ids - seen:
-        problems.append("rows missing from the log are lost on reindex")
+        problems.append("rows missing from the log are lost on reindex: run repair --apply")
     if seen - db_ids:
-        problems.append("log has entries the DB lacks: run reindex")
+        problems.append("log has entries the DB lacks: run repair --apply")
+    if bad_lines:
+        problems.append("unparseable log lines (see unparseable_log_lines)")
     report["problems"] = problems
     if not getattr(args, "pretty", False):
         report = {k: v for k, v in report.items() if v not in (0, {}, [], None)
@@ -2305,20 +2309,28 @@ def cmd_reindex(args):
     d = args.md_dir or md_dir_for(args.db)
     files = sorted(f for f in os.listdir(d) if f.endswith(".md")) \
         if os.path.isdir(d) else []
-    records = []
-    for f in files:
-        for n, line in enumerate(open(os.path.join(d, f), encoding="utf-8")):
-            m = MK_RE.search(line)
-            if m:
-                try:
-                    records.append((json.loads(m.group(1)), f, n))
-                except json.JSONDecodeError:
-                    print(f"skip malformed record {f}:{n + 1}", file=sys.stderr)
-    records.sort(key=lambda x: (x[0].get("at", ""), x[1], x[2]))
+    records, _bad = _scan_log(d)
     if os.path.exists(args.db):
         if not args.force:
             print(f"{args.db} exists; pass --force to replace it", file=sys.stderr)
             return 1
+        try:
+            c = sqlite3.connect(args.db)
+            db_ids = {r[0] for r in c.execute("SELECT id FROM memory_item")}
+            c.close()
+        except sqlite3.Error:
+            db_ids = set()
+        lost = sorted(db_ids - _log_capture_ids(records))
+        if lost and not args.drop_missing:
+            print(f"refusing: {len(lost)} row(s) are in the DB but not in the log "
+                  f"and would be lost:", file=sys.stderr)
+            for i in lost:
+                print(f"  would drop {i}", file=sys.stderr)
+            print("run `repair --apply` first to write them back to the log, or pass "
+                  "--drop-missing to rebuild without them", file=sys.stderr)
+            return 2
+        for i in lost:
+            print(f"dropping {i} (not in log)", file=sys.stderr)
         os.remove(args.db)
     init_db(args.db)
     _REPLAYING = True
@@ -2440,19 +2452,38 @@ def cmd_reindex(args):
     return 0
 
 
-def _read_log_records(d):
-    recs = []
+def _scan_log(d, quiet=False):
+    """Every mk record in the markdown log, sorted by time, plus the lines that
+    look like records but cannot be parsed (torn writes, hand edits). Each bad
+    line is reported on stderr as <file>:<line> unless quiet."""
+    recs, bad = [], []
     files = sorted(f for f in os.listdir(d) if f.endswith(".md")) if os.path.isdir(d) else []
     for f in files:
-        for n, line in enumerate(open(os.path.join(d, f), encoding="utf-8")):
+        for n, line in enumerate(open(os.path.join(d, f), encoding="utf-8", errors="replace")):
+            if "<!-- mk:" not in line:
+                continue
             m = MK_RE.search(line)
-            if m:
-                try:
-                    recs.append((json.loads(m.group(1)), f, n))
-                except json.JSONDecodeError:
-                    pass
+            try:
+                if not m:
+                    raise ValueError("torn line")
+                recs.append((json.loads(m.group(1)), f, n))
+            except (ValueError, json.JSONDecodeError):
+                bad.append(f"{f}:{n + 1}")
+    if bad and not quiet:
+        print(f"skipped {len(bad)} unparseable record(s):", file=sys.stderr)
+        for loc in bad:
+            print(f"  skipped unparseable record at {loc}", file=sys.stderr)
     recs.sort(key=lambda x: (x[0].get("at", ""), x[1], x[2]))
-    return recs
+    return recs, bad
+
+
+def _read_log_records(d):
+    return _scan_log(d)[0]
+
+
+def _log_capture_ids(recs):
+    return {r["id"] for r, _, _ in recs
+            if r.get("op") in ("capture", "distill") and r.get("id")}
 
 
 def cmd_repair(args):
@@ -2472,6 +2503,10 @@ def cmd_repair(args):
     missing = [r for r, _, _ in recs if r.get("op") == "capture" and r["id"] not in db_ids]
     orphans = sorted(db_ids - log_ids)
     print(f"drift: {len(missing)} log-only capture(s), {len(orphans)} db-only row(s)")
+    for r in missing:
+        print(f"  log-only {r['id']}")
+    for i in orphans:
+        print(f"  db-only  {i}")
     if not args.apply:
         print("dry run: pass --apply to repair (a backup is made first)")
         return 0
@@ -2537,6 +2572,10 @@ def cmd_repair(args):
                 db.close()
         finally:
             _REPLAYING = False
+    for i in sorted(new_ids):
+        print(f"  restored {i}")
+    for i in orphans:
+        print(f"  logged   {i}")
     print(f"repaired: restored {len(new_ids)} node(s), logged {len(orphans)} orphan(s)")
     return 0
 
@@ -2937,6 +2976,8 @@ def main():
     p = sub.add_parser("reindex")
     p.add_argument("--md-dir", default="")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--drop-missing", action="store_true",
+                   help="with --force: rebuild even if DB rows absent from the log are lost (each is named)")
     p.set_defaults(fn=cmd_reindex)
 
     p = sub.add_parser("repair", help="heal DB/log drift without dropping rows (dry run by default)")
@@ -2997,6 +3038,7 @@ def main():
 
     p = sub.add_parser("upkeep", help="run N bounded upkeep steps now (never required)")
     p.add_argument("--steps", type=int, default=1)
+    p.add_argument("--no-repair", action="store_true", help="skip the DB/log drift repair")
     p.set_defaults(fn=cmd_upkeep)
 
     p = sub.add_parser("upgrade", help="migrate an existing DB in place (backs up first)")
