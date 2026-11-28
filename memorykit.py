@@ -72,7 +72,7 @@ MODEL = os.environ.get("MEMORYKIT_MODEL", "BAAI/bge-small-en-v1.5")
 MODEL_DIR = os.environ.get("MEMORYKIT_MODEL_DIR") or os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
     "memorykit", "models")
-VERSION = "5.0.4"
+VERSION = "5.0.5"
 
 # Provenance -> (entry type, default confidence). Agent-originated content
 # is NEVER stored as fact: only user statements and tool observations earn
@@ -2557,6 +2557,21 @@ def _norm(t):
     return " ".join((t or "").split())
 
 
+def _visible_matches(cache, d, f, n, text):
+    """The human-readable part of a log line (before <!-- mk: -->), minus the
+    bullet and the [tag], must still say what the record's text says. It is
+    cut at 300 characters when written, so compare up to its length. An edit
+    to the visible line alone means a person touched it: not a provable copy."""
+    if f not in cache:
+        cache[f] = open(os.path.join(d, f), encoding="utf-8", errors="replace").readlines()
+    line = cache[f][n] if n < len(cache[f]) else ""
+    vis = line.split("<!-- mk:", 1)[0].strip()
+    vis = re.sub(r"^-\s*", "", vis)
+    vis = re.sub(r"^\[[^\]]*\]\s*", "", vis)
+    vis, want = _norm(vis), _norm(text)
+    return bool(vis) and want.startswith(vis) and (len(vis) >= len(want) or len(vis) >= 250)
+
+
 def _dedupe_plan(db_path, d):
     """Which log records are provable copies of a row, and why the rest stay.
 
@@ -2576,6 +2591,7 @@ def _dedupe_plan(db_path, d):
             first.setdefault(rec["id"], (rec, f, n))
     db = connect(db_path)
     remove, keep = [], []
+    lines = {}
     for rec, f, n in recs:
         eid = rec.get("id")
         if rec.get("op") not in ("capture", "distill") or not eid:
@@ -2591,6 +2607,8 @@ def _dedupe_plan(db_path, d):
             keep.append((eid, loc, "text differs from the original record"))
         elif _norm(rec.get("text")) != _norm(_body(row["content"])):
             keep.append((eid, loc, "text differs from the DB row"))
+        elif not _visible_matches(lines, d, f, n, rec.get("text")):
+            keep.append((eid, loc, "visible line differs from the record (hand edit?)"))
         else:
             remove.append((eid, f, n, f"{orig[1]}:{orig[2] + 1}"))
     db.close()

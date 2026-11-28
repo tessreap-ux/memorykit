@@ -110,8 +110,21 @@ def test_dedupe_refuses_unprovable():
     c.execute("update memory_item set content = content || ' (edited)' where id=?", (b,))
     c.commit()
     c.close()
+    # copy of c: only the visible half of the .md line hand-edited -> keep
+    cc = sem[2]
+    mk._log_from_row(db, cc)
+    d = mk.md_dir_for(db)
+    for f in glob.glob(os.path.join(d, "*.md")):
+        ls = open(f, encoding="utf-8").readlines()
+        idx = [i for i, ln in enumerate(ls) if f'"id": "{cc}"' in ln and '"op": "capture"' in ln]
+        if idx:
+            i = idx[-1]
+            vis, rest = ls[i].split("<!-- mk:", 1)
+            ls[i] = vis.replace("orchid", "ORCHID-EDITED") + "<!-- mk:" + rest
+            open(f, "w", encoding="utf-8").writelines(ls)
     ops = log_ops(db)
     rc, o = run(db, "repair", "--dedupe-log", "--apply")
+    assert f"keep   {cc} at " in o and "visible line differs" in o, o
     assert f"keep   {a} at " in o and "row not in DB" in o, o
     assert f"keep   {b} at " in o and "differs" in o, o
     assert log_ops(db) == ops, "removed an unprovable record"

@@ -1,5 +1,11 @@
 # Changelog
 
+## 5.0.5
+
+- `repair --dedupe-log` now also checks the visible half of each log line, the text before `<!-- mk: -->`, against the record. Before, a hand edit to only the visible .md text still read as a match and the record could be deleted. Now it's kept as `visible line differs from the record (hand edit?)`. Found by Miso.
+- Gate check (Miso's condition): a log chewed by 5.0.2 still finds 10 provable copies, removes 10, rebuilds with no skips and an identical row hash, and health reports no problems. The tightening did not turn the feature off.
+- test_dedupe_log.py covers the visible-line hand edit.
+
 ## 5.0.4
 
 Review and rules for all three changes: Miso.
