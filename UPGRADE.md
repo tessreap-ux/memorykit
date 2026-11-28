@@ -21,3 +21,12 @@ Your data stays where it is. Nothing is exported, moved, or re-imported.
 
 To roll back: put the 4.5 `memorykit.py` back and copy the `.bak` file over
 the database. The markdown log in `memory-log/` is unchanged by the upgrade.
+
+## Logs touched by 5.0.2 `repair --apply`
+
+5.0.2 repair re-logged distilled rows as captures. 5.0.3 and later rebuild correctly anyway: `reindex` skips the copies and names each one. To clear them from the log:
+
+    memorykit --db <your memory.db> repair --dedupe-log            # dry run: every id, and why any is kept
+    memorykit --db <your memory.db> repair --dedupe-log --apply    # backs up memory-log/ first
+
+Only exact copies of a row that still exists are removed. Anything else stays and is named.

@@ -59,6 +59,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import uuid
@@ -71,7 +72,7 @@ MODEL = os.environ.get("MEMORYKIT_MODEL", "BAAI/bge-small-en-v1.5")
 MODEL_DIR = os.environ.get("MEMORYKIT_MODEL_DIR") or os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
     "memorykit", "models")
-VERSION = "5.0.3"
+VERSION = "5.0.4"
 
 # Provenance -> (entry type, default confidence). Agent-originated content
 # is NEVER stored as fact: only user statements and tool observations earn
@@ -1831,17 +1832,71 @@ def _distill_step(db_path, limit=None):
 # ------------------------------------------------- v5: the two-hook contract
 
 def pre_turn(db_path, query, budget=250, prefer_source="", limit=6,
-             chars=220):
+             chars=220, repair=False):
     """Start of turn. Repairs any interrupted write, then returns the hits
     for `query` as terse lines within ~`budget` tokens. With prefer_source,
     up to two slots (and ~40% of the budget) go to that speaker first."""
     if not os.path.exists(db_path):
         init_db_quiet(db_path)
     replay_journal(db_path)
+    _maybe_repair(db_path, force=repair)
     if not (query or "").strip():
         return ""
     with writer_lock(db_path):  # search bumps access stats: one writer at a time
         return _pre_turn_search(db_path, query, budget, prefer_source, limit, chars)
+
+
+REPAIR_EVERY = int(os.environ.get("MEMORYKIT_REPAIR_EVERY", "0"))
+
+
+def _drift(db_path):
+    recs = _read_log_records(md_dir_for(db_path))
+    db = connect(db_path)
+    db_ids = {r[0] for r in db.execute("SELECT id FROM memory_item")}
+    db.close()
+    log_ids = _log_capture_ids(recs)
+    log_only = {r["id"] for r, _, _ in recs if r.get("op") == "capture"} - db_ids
+    return sorted(log_only), sorted(db_ids - log_ids)
+
+
+def _maybe_repair(db_path, force=False, trigger="pre-turn"):
+    """Drift repair inside the turn, only when asked: every
+    MEMORYKIT_REPAIR_EVERY turns (0 = never, the default) or with force.
+    A full pass reads the whole log, so a large store should not pay for it
+    every turn. When it repairs anything it says so on stderr and logs a
+    repair_run record naming every id it touched. Never raises."""
+    try:
+        if not force:
+            if REPAIR_EVERY <= 0:
+                return None
+            db = connect(db_path)
+            n = int(state_get(db, "repair_turns", 0) or 0) + 1
+            due = n >= REPAIR_EVERY
+            state_set(db, "repair_turns", 0 if due else n)
+            db.commit()
+            db.close()
+            if not due:
+                return None
+        log_only, db_only = _drift(db_path)
+        if not log_only and not db_only:
+            return {"restored": [], "logged": []}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cmd_repair(argparse.Namespace(db=db_path, md_dir="", apply=True,
+                                          drift=True, dedupe_log=False))
+        restored = re.findall(r"^\s+restored (\S+)", out.getvalue(), re.M)
+        logged = re.findall(r"^\s+logged\s+(\S+)", out.getvalue(), re.M)
+        bak = re.search(r"^backup: (.+)$", out.getvalue(), re.M)
+        log_md(db_path, {"op": "repair_run", "at": now_iso(), "trigger": trigger,
+                         "restored": restored, "logged": logged,
+                         "backup": bak.group(1) if bak else ""},
+               f"{trigger} repair: restored {len(restored)}, logged {len(logged)}")
+        print(f"memorykit: {trigger} repair restored {len(restored)}, logged "
+              f"{len(logged)}: " + " ".join(restored + logged), file=sys.stderr)
+        return {"restored": restored, "logged": logged}
+    except Exception as e:  # a repair problem must not cost the turn its recall
+        print(f"memorykit: pre-turn repair skipped: {e}", file=sys.stderr)
+        return None
 
 
 def _pre_turn_search(db_path, query, budget, prefer_source, limit, chars):
@@ -1891,7 +1946,7 @@ def init_db_quiet(db_path):
 
 def cmd_pre_turn(args):
     out = pre_turn(args.db, args.query, args.budget, args.prefer_source,
-                   args.limit, args.chars)
+                   args.limit, args.chars, repair=args.repair)
     print(out or ("(no matches)" if args.query.strip() else ""))
     return 0
 
@@ -1927,14 +1982,10 @@ def cmd_post_turn(args):
 def cmd_upkeep(args):
     replay_journal(args.db)
     if not getattr(args, "no_repair", False):
-        recs = _read_log_records(md_dir_for(args.db))
-        db = connect(args.db)
-        db_ids = {r[0] for r in db.execute("SELECT id FROM memory_item")}
-        db.close()
-        log_ids = _log_capture_ids(recs)
-        if db_ids - log_ids or {r["id"] for r, _, _ in recs
-                                if r.get("op") == "capture"} - db_ids:
-            cmd_repair(argparse.Namespace(db=args.db, md_dir="", apply=True, drift=True))
+        r = _maybe_repair(args.db, force=True, trigger="upkeep")
+        if r and (r["restored"] or r["logged"]):
+            print(f"repair: restored {len(r['restored'])}, logged {len(r['logged'])} "
+                  "(named in a repair_run log record)")
     tot = {}
     for _ in range(max(1, args.steps)):
         for k, v in upkeep_step(args.db).items():
@@ -2337,15 +2388,15 @@ def cmd_reindex(args):
     _REPLAYING = True
     counts = {}
     distilled = {r["id"] for r, _, _ in records if r.get("op") == "distill" and r.get("id")}
-    built, dup = set(), 0
+    built, dup = set(), []
     try:
-        for rec, _, _ in records:
+        for rec, f, n in records:
             op = rec.get("op")
             if op in ("capture", "distill"):
                 # 5.0.2 repair could log a distilled row a second time as a
                 # capture; the distill record is the real one.
                 if rec.get("id") in built or (op == "capture" and rec.get("id") in distilled):
-                    dup += 1
+                    dup.append((rec.get("id"), op, f"{f}:{n + 1}"))
                     continue
                 built.add(rec.get("id"))
             counts[op] = counts.get(op, 0) + 1
@@ -2460,8 +2511,11 @@ def cmd_reindex(args):
     print(f"reindexed {len(records)} record(s) from {len(files)} file(s): "
           + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     if dup:
-        print(f"skipped {dup} duplicate record(s) for rows already built "
-              "(e.g. distilled rows re-logged by 5.0.2 repair)")
+        print(f"skipped {len(dup)} duplicate record(s) for rows already built "
+              "(e.g. distilled rows re-logged by 5.0.2 repair); "
+              "`repair --dedupe-log` removes the ones it can prove are copies:")
+        for eid, op, loc in dup:
+            print(f"  skipped duplicate {op} {eid} at {loc}")
     return 0
 
 
@@ -2499,6 +2553,102 @@ def _log_capture_ids(recs):
             if r.get("op") in ("capture", "distill") and r.get("id")}
 
 
+def _norm(t):
+    return " ".join((t or "").split())
+
+
+def _dedupe_plan(db_path, d):
+    """Which log records are provable copies of a row, and why the rest stay.
+
+    A record is removed only when all of these hold: another record for the
+    same id comes first in the log (the distill record, else the earliest
+    capture); the row with that id still exists in the DB; and the copy's
+    text, the original's text and the row's text are identical (whitespace
+    aside). Anything short of that is kept and named with its reason. No
+    label ("db-only", "duplicate") is trusted on its own."""
+    recs, _bad = _scan_log(d, quiet=True)
+    first = {}
+    for rec, f, n in recs:  # distill record is the original when one exists
+        if rec.get("op") == "distill" and rec.get("id"):
+            first.setdefault(rec["id"], (rec, f, n))
+    for rec, f, n in recs:
+        if rec.get("op") == "capture" and rec.get("id"):
+            first.setdefault(rec["id"], (rec, f, n))
+    db = connect(db_path)
+    remove, keep = [], []
+    for rec, f, n in recs:
+        eid = rec.get("id")
+        if rec.get("op") not in ("capture", "distill") or not eid:
+            continue
+        orig = first.get(eid)
+        if orig is None or (orig[1], orig[2]) == (f, n):
+            continue  # this record is the original
+        loc = f"{f}:{n + 1}"
+        row = db.execute("SELECT content FROM memory_item WHERE id=?", (eid,)).fetchone()
+        if row is None:
+            keep.append((eid, loc, "row not in DB; the copy may be the only trace"))
+        elif _norm(rec.get("text")) != _norm(orig[0].get("text")):
+            keep.append((eid, loc, "text differs from the original record"))
+        elif _norm(rec.get("text")) != _norm(_body(row["content"])):
+            keep.append((eid, loc, "text differs from the DB row"))
+        else:
+            remove.append((eid, f, n, f"{orig[1]}:{orig[2] + 1}"))
+    db.close()
+    return remove, keep
+
+
+def cmd_dedupe_log(args):
+    d = args.md_dir or md_dir_for(args.db)
+    remove, keep = _dedupe_plan(args.db, d)
+    print(f"dedupe: {len(remove)} provable duplicate record(s), {len(keep)} kept")
+    for eid, f, n, orig in remove:
+        print(f"  remove {eid} at {f}:{n + 1} (copy of {orig}; row exists; text matches)")
+    for eid, loc, why in keep:
+        print(f"  keep   {eid} at {loc}: {why}")
+    if not args.apply:
+        print("dry run: pass --apply to remove them (the log is backed up first)")
+        return 0
+    if not remove:
+        print("nothing to remove")
+        return 0
+    with writer_lock(args.db):
+        remove, _ = _dedupe_plan(args.db, d)  # re-check under the lock
+        bak = f"{d.rstrip(os.sep)}.pre-dedupe-{int(time.time())}"
+        shutil.copytree(d, bak)
+        print(f"backup: {bak}")
+        by_file = {}
+        for eid, f, n, orig in remove:
+            by_file.setdefault(f, {})[n] = eid
+        done = []
+        for f, lines in by_file.items():
+            path = os.path.join(d, f)
+            src = open(path, encoding="utf-8", errors="replace").readlines()
+            out = []
+            for n, line in enumerate(src):
+                eid = lines.get(n)
+                m = MK_RE.search(line) if eid else None
+                if m and json.loads(m.group(1)).get("id") == eid:
+                    done.append((eid, f"{f}:{n + 1}"))
+                    continue
+                if eid:
+                    print(f"  kept {eid} at {f}:{n + 1}: line changed since the plan",
+                          file=sys.stderr)
+                out.append(line)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.writelines(out)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+    for eid, loc in done:
+        print(f"  removed {eid} at {loc}")
+    log_md(args.db, {"op": "dedupe_log", "at": now_iso(), "backup": bak,
+                     "removed": [{"id": e, "at_line": l} for e, l in done]},
+           f"dedupe-log removed {len(done)} duplicate record(s); backup {bak}")
+    print(f"deduped: removed {len(done)} record(s); the list is logged as a dedupe_log record")
+    return 0
+
+
 def cmd_repair(args):
     """Heal drift between the DB and the markdown log without losing either side.
 
@@ -2507,6 +2657,8 @@ def cmd_repair(args):
     relate and weigh records that touch them). Nothing is dropped; running it
     twice changes nothing the second time."""
     global _REPLAYING
+    if getattr(args, "dedupe_log", False):
+        return cmd_dedupe_log(args)
     d = args.md_dir or md_dir_for(args.db)
     recs = _read_log_records(d)
     db = connect(args.db)
@@ -2997,6 +3149,9 @@ def main():
     p.add_argument("--drift", action="store_true", help="(default and only mode)")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--md-dir", default="")
+    p.add_argument("--dedupe-log", action="store_true",
+                   help="remove log records that are provable copies of a row "
+                        "(same id, row exists, identical text); every id named")
     p.set_defaults(fn=cmd_repair)
 
     p = sub.add_parser("sleep",
@@ -3029,6 +3184,8 @@ def main():
                    help="reserve up to 2 slots for this speaker (e.g. the user)")
     p.add_argument("--limit", type=int, default=6)
     p.add_argument("--chars", type=int, default=220)
+    p.add_argument("--repair", action="store_true",
+                   help="run a drift repair this turn (else every MEMORYKIT_REPAIR_EVERY turns; 0 = never)")
     p.set_defaults(fn=cmd_pre_turn)
 
     p = sub.add_parser("post-turn", help="end of turn: journal, store, one upkeep step")

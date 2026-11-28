@@ -1,5 +1,14 @@
 # Changelog
 
+## 5.0.4
+
+Review and rules for all three changes: Miso.
+
+- `repair --dedupe-log [--apply]` removes log records that are provable copies, such as distilled rows that 5.0.2 repair re-logged as captures. A record is removed only when three things hold: an earlier record for the same id exists (the distill record, else the first capture), the row still exists in the DB, and the copy's text, the original's text and the row's text are identical. Every other record is kept and named with the reason. Dry run by default. `--apply` backs the log up to `<log>.pre-dedupe-<ts>`, re-checks under the writer lock, names every removed id with its file:line, and writes a `dedupe_log` record listing them.
+- `reindex` names every duplicate it skips (`skipped duplicate capture <id> at <file>:<line>`) instead of printing a count.
+- `pre-turn` can run drift repair, but never on every turn by default. It runs every `MEMORYKIT_REPAIR_EVERY` turns (default 0, never) or when you pass `--repair`. When it repairs anything, it prints the ids on stderr and logs a `repair_run` record naming each id it restored or logged, plus the DB backup. `upkeep` repair now writes the same record.
+- New test: test_dedupe_log.py (damaged and clean logs, refusal on unprovable copies, gated and logged pre-turn repair).
+
 ## 5.0.3
 
 - `repair` and `upkeep` count distill records as logged. 5.0.2 called distilled rows db-only and re-logged them as captures (found on a 13,089-row store: 977 rows).

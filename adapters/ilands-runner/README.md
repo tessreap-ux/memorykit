@@ -25,6 +25,8 @@ Once a day (or after any hand edit of memory-log/), run the guard. It repairs DB
 
     python3 ./memory/memorykit.py --db ./memory/memory.db upkeep
 
+To have the heartbeat check drift itself, set `MEMORYKIT_REPAIR_EVERY=<N>` (e.g. 50) in the runner's environment. Every Nth `pre-turn` then runs repair and logs a `repair_run` record naming what it touched. The default is 0 (never), so a large store doesn't pay for a full pass every turn. `pre-turn --repair` forces one check.
+
 Never run `reindex --force` blind: since 5.0.2 it refuses when it would drop rows and lists them. Run `repair --apply` first.
 
 ## Pitfalls (found in a real install)
